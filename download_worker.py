@@ -4,6 +4,10 @@ from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 from PyQt6.QtCore import pyqtSignal, QObject
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
 
 class DownloadWorker(QObject):
     """
@@ -14,15 +18,105 @@ class DownloadWorker(QObject):
     file_downloaded = pyqtSignal(str, str)  # İndirilen dosyanın tam yolu ve adı
     progress = pyqtSignal(int, int) # Mevcut sayfa ve toplam sayfa sayısı için
     
-    def __init__(self, base_url, download_folder, max_pages=None):
+    def __init__(self, base_url, download_folder, max_pages=None, js_script_path=None):
         super().__init__()
         self.base_url = base_url
         self.download_folder = download_folder
         self.is_running = True
         self.max_pages = max_pages # İndirilecek maksimum sayfa sayısı
         self.downloaded_pages = 0
+        self.js_script_path = js_script_path # JS dosyası yolu (None ise normal indirme)
 
     def run(self):
+        """İndirme işlemini başlatan ana fonksiyon."""
+        if self.js_script_path and os.path.exists(self.js_script_path):
+            self._run_selenium()
+        else:
+            self._run_standard()
+            
+    def _run_selenium(self):
+        """JS kodlarını Selenium üzerinden çalıştırarak indirir."""
+        driver = None
+        try:
+            self.progress.emit(0, 100)
+            
+            # Chrome ayarlarını yapılandır
+            chrome_options = Options()
+            # chrome_options.add_argument("--headless") # Kullanıcının bot kontrolünü (cloudflare vs) aşması için headless kapalı önerilir, ancak eklenebilir.
+            prefs = {"download.default_directory": self.download_folder,
+                     "download.prompt_for_download": False,
+                     "download.directory_upgrade": True}
+            chrome_options.add_experimental_option("prefs", prefs)
+            
+            # WebDriver Başlat
+            self.progress.emit(10, 100)
+            driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+            
+            # Hedef URL'ye git
+            self.progress.emit(20, 100)
+            driver.get(self.base_url)
+            
+            # Kullanıcıya cloudflare aşması için biraz süre tanıyabiliriz veya script doğrudan bunu halledebilir.
+            time.sleep(3) 
+
+            # JS Dosyasını Oku
+            with open(self.js_script_path, 'r', encoding='utf-8') as f:
+                js_code = f.read()
+
+            self.progress.emit(40, 100)
+            
+            # İndirme klasöründeki mevcut txt dosyalarını al (yeni geleni tespit etmek için)
+            existing_files = set(f for f in os.listdir(self.download_folder) if f.endswith('.txt'))
+            
+            # JS Kodunu Enjekte Et ve Çalıştır
+            # Not: .js dosyası bir IIFE (Immediately Invoked Function Expression) olduğu için await çalıştırması yapacak.
+            driver.execute_script(js_code)
+            
+            self.progress.emit(60, 100)
+
+            # Dosyanın inmesini bekle (Maksimum 10 dakika bekleyelim, büyük romanlar uzun sürebilir)
+            wait_time = 0
+            max_wait_time = 600 
+            downloaded_file = None
+            
+            while wait_time < max_wait_time and self.is_running:
+                current_files = set(f for f in os.listdir(self.download_folder) if f.endswith('.txt'))
+                new_files = current_files - existing_files
+                
+                # Geçici indirme dosyalarını (crdownload vs) saymıyoruz (".txt" ile bittiği için sorun yok)
+                if new_files:
+                    downloaded_file = new_files.pop()
+                    break
+                    
+                time.sleep(2)
+                wait_time += 2
+                
+                # Progres barı yalandan biraz oynat (60-95 arası)
+                simulated_progress = min(95, 60 + int((wait_time / max_wait_time) * 35))
+                self.progress.emit(simulated_progress, 100)
+
+            if not self.is_running:
+                print("İndirme iptal edildi.")
+                return
+
+            if downloaded_file:
+                # İndirme algılandı
+                full_path = os.path.join(self.download_folder, downloaded_file)
+                self.progress.emit(100, 100)
+                self.file_downloaded.emit(full_path, downloaded_file)
+            else:
+                self.error.emit(f"Zaman aşımı: {max_wait_time} saniye boyunca indirme algılanamadı veya script hata verdi.")
+
+        except Exception as e:
+            self.error.emit(f"Selenium Hatası: {str(e)}")
+        finally:
+            if driver:
+                driver.quit()
+            self.finished.emit()
+            print("Selenium işçisi tamamlandı/durduruldu.")
+
+
+    def _run_standard(self):
         """İndirme işlemini başlatan ana fonksiyon."""
         try:
             headers = {

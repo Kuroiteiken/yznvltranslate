@@ -9,8 +9,8 @@ import time
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QMenuBar, QListWidget, 
     QTableWidget, QTableWidgetItem, QPushButton, QHBoxLayout, 
-    QVBoxLayout, QHeaderView, QCheckBox, QSizePolicy,  # QCheckBox eklendi
-    QMessageBox, QProgressBar, QLabel, QMenu, QSpinBox
+    QVBoxLayout, QHeaderView, QCheckBox, QSizePolicy,QComboBox,
+    QMessageBox, QProgressBar, QLabel, QMenu, QSpinBox, QFileDialog
 )
 from PyQt6.QtGui import QFont, QColor, QAction
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer
@@ -26,6 +26,7 @@ from token_counter import count_tokens_in_file, load_token_data, save_token_data
 from utils import format_file_size, natural_sort_key
 from chapter_check_worker import ChapterCheckWorker # Yeni worker eklendi
 from epub_worker import EpubWorker
+from split_worker import SplitWorker
 
 class TokenCountWorker(QObject):
     finished = pyqtSignal(dict) # Tüm token verilerini döndür
@@ -160,6 +161,8 @@ class MainWindow(QMainWindow):
         self.chapter_check_worker = None  # Yeni: Başlık kontrolü için worker
         self.epub_thread = None
         self.epub_worker = None
+        self.split_thread = None
+        self.split_worker = None
 
         self._ensure_app_structure()
         self.current_project_path = None 
@@ -206,8 +209,8 @@ class MainWindow(QMainWindow):
         config = configparser.ConfigParser()
         if os.path.exists(config_path):
             config.read(config_path)
-            return config.get("Version", "model_name", fallback="gemini-2.5-flash-preview-09-2025")
-        return "gemini-2.5-flash-preview-09-2025"
+            return config.get("Version", "model_name", fallback="gemini-2.5-flash")
+        return "gemini-2.5-flash"
     
     def _create_menu_bar(self):
         menu_bar = self.menuBar()
@@ -237,9 +240,37 @@ class MainWindow(QMainWindow):
         gemini_version_action = settings_menu.addAction("Gemini Versiyon")
         gemini_version_action.triggered.connect(self.open_gemini_version_dialog)
 
+        # --- YENİ JS SAVE MENÜSÜ ---
+        js_save_menu = menu_bar.addMenu("JS Save")
+        
+        save_booktoki_action = js_save_menu.addAction("Booktoki")
+        save_booktoki_action.triggered.connect(lambda: self.save_js_file("booktoki.js"))
+        
+        save_69shuba_action = js_save_menu.addAction("69shuba")
+        save_69shuba_action.triggered.connect(lambda: self.save_js_file("69shuba.js"))
+
         help_menu = menu_bar.addMenu("Yardım")
         about_action = help_menu.addAction("Hakkında")
         about_action.triggered.connect(self.show_about_dialog)
+
+    def save_js_file(self, js_filename):
+        """Kullanıcının seçtiği JS dosyasını istediği yere kaydetmesini sağlar."""
+        source_path = os.path.join(os.getcwd(), js_filename)
+        
+        if not os.path.exists(source_path):
+            QMessageBox.warning(self, "Dosya Bulunamadı", f"'{js_filename}' dosyası ana dizinde bulunamadı!")
+            return
+            
+        default_save_path = os.path.join(os.path.expanduser("~"), "Desktop", js_filename)
+        save_path, _ = QFileDialog.getSaveFileName(self, f"{js_filename} Dosyasını Kaydet", default_save_path, "JavaScript Files (*.js);;All Files (*)")
+        
+        if save_path:
+            try:
+                import shutil
+                shutil.copy2(source_path, save_path)
+                QMessageBox.information(self, "Başarılı", f"Dosya başarıyla kaydedildi:\n{save_path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Kayıt Hatası", f"Dosya kaydedilirken bir hata oluştu:\n{str(e)}")
 
     def open_prompt_editor(self):
         PromptEditorDialog(self).exec()
@@ -289,11 +320,28 @@ class MainWindow(QMainWindow):
     def _create_right_panel(self):
         right_layout = QVBoxLayout()
         
+        # Yeni İndirme Yöntemi Combo Box (İndirme öncesi ayarları)
+        self.downloadMethodCombo = QComboBox()
+        self.downloadMethodCombo.addItems([
+            "Normal Web Kazıma (Requests) (önerilen)",
+            "Booktoki JS İle İndir (Selenium)",
+            "69shuba JS İle İndir (Selenium)"
+        ])
+        self.downloadMethodCombo.setStyleSheet("padding: 5px; font-size: 10pt;")
+        right_layout.addWidget(QLabel("İndirme Yöntemi:"))
+        right_layout.addWidget(self.downloadMethodCombo)
+
         self.startButton = QPushButton("İndirmeyi Başlat")
         self.startButton.setFont(QFont("Arial", 11, QFont.Weight.Bold))
         self.startButton.setStyleSheet("background-color: #4CAF50; color: white; border-radius: 5px; padding: 10px;")
         self.startButton.clicked.connect(self.start_download_process)
         right_layout.addWidget(self.startButton)
+
+        self.splitButton = QPushButton("Toplu Bölüm Ekle")
+        self.splitButton.setFont(QFont("Arial", 11, QFont.Weight.Bold))
+        self.splitButton.setStyleSheet("background-color: #3F51B5; color: white; border-radius: 5px; padding: 10px;")
+        self.splitButton.clicked.connect(self.start_split_process)
+        right_layout.addWidget(self.splitButton)
 
         self.translateButton = QPushButton("Seçilenleri Çevir") 
         self.translateButton.setFont(QFont("Arial", 11, QFont.Weight.Bold))
@@ -310,8 +358,8 @@ class MainWindow(QMainWindow):
         self.limit_spinbox = QSpinBox()
         self.limit_spinbox.setMinimum(1)
         self.limit_spinbox.setMaximum(99999)
-        self.limit_spinbox.setValue(10) # Varsayılan değer
-        self.limit_spinbox.setEnabled(False) # Başlangıçta pasif
+        self.limit_spinbox.setValue(20) # Varsayılan değer
+        self.limit_spinbox.setEnabled(True) # Başlangıçta pasif
         
         # Checkbox işaretlenince spinbox aktif olsun
         self.limit_checkbox.toggled.connect(self.limit_spinbox.setEnabled)
@@ -373,6 +421,7 @@ class MainWindow(QMainWindow):
         self.statusLabel = QLabel("Durum: Hazır")
         self.statusLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.statusLabel.setFont(QFont("Arial", 10))
+        self.statusLabel.setWordWrap(True)
         right_layout.addWidget(self.statusLabel)
 
         # Yeni token bilgileri ve ilerleme çubuğu
@@ -439,7 +488,7 @@ class MainWindow(QMainWindow):
     def new_project_clicked(self):
         dialog = NewProjectDialog(self)
         if dialog.exec():
-            project_name, project_link, max_pages, api_key, startpromt = dialog.get_data()
+            project_name, project_link, max_pages, max_retries, api_key, startpromt = dialog.get_data()
             if not project_name or not project_link:
                 QMessageBox.warning(self, "Eksik Bilgi", "Proje adı ve linki boş bırakılamaz.")
                 return
@@ -460,6 +509,7 @@ class MainWindow(QMainWindow):
                 self.config['ProjectInfo'] = {'link': project_link}
                 if max_pages is not None:
                     self.config['ProjectInfo']['max_pages'] = str(max_pages)
+                self.config['ProjectInfo']['max_retries'] = str(max_retries)
                 self.config['API'] = {'gemini_api_key': api_key} 
                 self.config["Startpromt"] = {'startpromt': startpromt}  # Yeni başlangıç istemi ekleniyor
                 config_path = os.path.join(base_path, 'config', 'config.ini') 
@@ -539,8 +589,22 @@ class MainWindow(QMainWindow):
             self.download_thread = None
             self.download_worker = None
 
+        # JS Script Yolu Belirleme
+        selected_method = self.downloadMethodCombo.currentText()
+        js_script_path = None
+        if "Booktoki" in selected_method:
+            js_script_path = os.path.join(os.getcwd(), "booktoki.js")
+            if not os.path.exists(js_script_path):
+                QMessageBox.warning(self, "Dosya Bulunamadı", "booktoki.js dosyası mevcut dizinde bulunamadı!")
+                return
+        elif "69shuba" in selected_method:
+            js_script_path = os.path.join(os.getcwd(), "69shuba.js")
+            if not os.path.exists(js_script_path):
+                QMessageBox.warning(self, "Dosya Bulunamadı", "69shuba.js dosyası mevcut dizinde bulunamadı!")
+                return
+
         self.download_thread = QThread()
-        self.download_worker = DownloadWorker(project_link, download_folder, max_pages) 
+        self.download_worker = DownloadWorker(project_link, download_folder, max_pages, js_script_path) 
         self.download_worker.moveToThread(self.download_thread)
         
         self.download_thread.started.connect(self.download_worker.run)
@@ -554,8 +618,14 @@ class MainWindow(QMainWindow):
         self.download_worker.progress.connect(self.update_download_progress) 
         
         self.download_thread.start()
-        self._set_ui_state_on_process_start(self.startButton, "İndiriliyor...", "#FFC107", "black", max_pages if max_pages else 0, "Durum: İndirme işlemi başlatıldı...")
-        self.file_table.setRowCount(0) 
+        
+        # JS kullanılıyorsa max_pages önceden bilinmediği için progress max değerini gizleyelim (100 ile sabitliyoruz logikte)
+        if js_script_path:
+            self._set_ui_state_on_process_start(self.startButton, "İndiriliyor (Tarayıcı)...", "#FFC107", "black", 100, "Durum: Tarayıcı ile indiriliyor...")
+        else:
+            self._set_ui_state_on_process_start(self.startButton, "İndiriliyor...", "#FFC107", "black", max_pages if max_pages else 0, "Durum: İndirme işlemi başlatıldı...")
+        
+        self.file_table.setRowCount(0)
 
     def update_download_progress(self, current, total):
         self.progressBar.setValue(current)
@@ -577,6 +647,72 @@ class MainWindow(QMainWindow):
         self._set_ui_state_on_process_end(self.startButton, "İndirmeyi Başlat", "#FF5722", "white", f"Durum: Hata - {message}")
         self.download_thread = None
         self.download_worker = None
+
+    def start_split_process(self):
+        from PyQt6.QtWidgets import QFileDialog
+
+        current_item = self.project_list.currentItem()
+        if not current_item:
+            QMessageBox.warning(self, "Proje Seçilmedi", "Lütfen sol listeden bir proje seçin.")
+            return
+
+        project_name = current_item.text()
+        project_path = os.path.join(os.getcwd(), project_name)
+
+        input_file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Bölünecek TXT Dosyasını Seçin",
+            "",
+            "Text Dosyaları (*.txt);;Tüm Dosyalar (*)"
+        )
+
+        if not input_file_path:
+            return  # Kullanıcı seçimi iptal etti
+
+        output_folder = os.path.join(project_path, 'dwnld')
+        os.makedirs(output_folder, exist_ok=True)
+
+        if self.split_thread and self.split_thread.isRunning():
+            self.split_worker.stop()
+            self.split_thread.quit()
+            self.split_thread.wait()
+            self.split_thread = None
+            self.split_worker = None
+
+        self.split_thread = QThread()
+        self.split_worker = SplitWorker(input_file_path, output_folder)
+        self.split_worker.moveToThread(self.split_thread)
+
+        self.split_thread.started.connect(self.split_worker.run)
+        self.split_worker.finished.connect(self.split_thread.quit)
+        self.split_worker.finished.connect(self.split_worker.deleteLater)
+        self.split_thread.finished.connect(self.split_thread.deleteLater)
+
+        self.split_worker.finished.connect(self.on_split_finished)
+        self.split_worker.error.connect(self.on_split_error)
+        self.split_worker.progress.connect(self.update_split_progress)
+
+        self.split_thread.start()
+        self._set_ui_state_on_process_start(self.splitButton, "Bölünüyor...", "#FFC107", "black", 100, "Durum: Dosya parçalanıyor...")
+
+    def update_split_progress(self, current, total):
+        self.progressBar.setValue(current)
+        if total > 0:
+            self.progressBar.setMaximum(total)
+            self.statusLabel.setText(f"Durum: Parçalanıyor... {current}/{total} bölüm oluşturuldu")
+
+    def on_split_finished(self):
+        QMessageBox.information(self, "Tamamlandı", "Dosya başarıyla parçalandı ve projeye eklendi.")
+        self._set_ui_state_on_process_end(self.splitButton, "Toplu Bölüm Ekle", "#3F51B5", "white", "Durum: Hazır")
+        self.split_thread = None
+        self.split_worker = None
+        self.update_file_list_from_selection()
+
+    def on_split_error(self, message):
+        QMessageBox.critical(self, "Parçalama Hatası", f"Bir hata oluştu:\n{message}")
+        self._set_ui_state_on_process_end(self.splitButton, "Toplu Bölüm Ekle", "#FF5722", "white", f"Durum: Hata - {message}")
+        self.split_thread = None
+        self.split_worker = None
 
     def start_translation_process(self):
         # Eğer zaten çalışıyorsa duraklatma/devam etme mantığını işlet
@@ -644,8 +780,10 @@ class MainWindow(QMainWindow):
         file_limit = None
         if self.limit_checkbox.isChecked():
             file_limit = self.limit_spinbox.value()
+            
+        max_retries = self.config.getint('ProjectInfo', 'max_retries', fallback=3)
         self.translation_thread = QThread()
-        self.translation_worker = TranslationWorker(input_folder, output_folder, api_key, startpromt, model_version, file_limit=file_limit)
+        self.translation_worker = TranslationWorker(input_folder, output_folder, api_key, startpromt, model_version, file_limit=file_limit, max_retries=max_retries)
         
         self.translation_worker.shutdown_on_finish = self.shutdown_checkbox.isChecked()
         self.translation_worker.moveToThread(self.translation_thread)
@@ -1119,6 +1257,8 @@ class MainWindow(QMainWindow):
     def _set_ui_state_on_process_start(self, button, text, bg_color, text_color, max_progress, status_text):
         """İşlem başladığında UI durumunu ayarlar."""
         self.startButton.setEnabled(False)
+        self.splitButton.setEnabled(False)
+        self.downloadMethodCombo.setEnabled(False)
         self.translateButton.setEnabled(False)
         self.cleanButton.setEnabled(False)
         self.mergeButton.setEnabled(False)
@@ -1141,6 +1281,8 @@ class MainWindow(QMainWindow):
     def _set_ui_state_on_process_end(self, button, text, bg_color, text_color, status_text):
         """İşlem bittiğinde UI durumunu ayarlar."""
         self.startButton.setEnabled(True)
+        self.splitButton.setEnabled(True)
+        self.downloadMethodCombo.setEnabled(True)
         self.translateButton.setEnabled(True)
         self.cleanButton.setEnabled(True)
         self.mergeButton.setEnabled(True)
@@ -1162,7 +1304,9 @@ class MainWindow(QMainWindow):
         current_item = self.project_list.currentItem()
         if not current_item:
             self.current_project_path = None
+            self.downloadMethodCombo.setEnabled(False)
             self.translateButton.setEnabled(False)
+            self.splitButton.setEnabled(False)
             self.cleanButton.setEnabled(False)
             self.mergeButton.setEnabled(False)
             self.chapterCheckButton.setEnabled(False) # Deaktif
@@ -1186,7 +1330,9 @@ class MainWindow(QMainWindow):
         translated_folder = os.path.join(self.current_project_path, 'trslt')
         completed_folder = os.path.join(self.current_project_path, 'cmplt') 
 
+        self.downloadMethodCombo.setEnabled(True)
         self.translateButton.setEnabled(True)
+        self.splitButton.setEnabled(True)
         self.cleanButton.setEnabled(True)
         self.mergeButton.setEnabled(True)
         self.chapterCheckButton.setEnabled(True) # Aktif
@@ -1629,8 +1775,10 @@ class MainWindow(QMainWindow):
 
         project_link = ""
         max_pages = None
+        max_retries = 3
         api_key = ""  # Varsayılan API anahtarı
         startpromt = ""
+        gemini_version = self.get_gemini_model_version()
         
 
         if os.path.exists(config_path):
@@ -1639,23 +1787,35 @@ class MainWindow(QMainWindow):
                     self.config.read_file(f)
                 project_link = self.config.get('ProjectInfo', 'link', fallback="")
                 max_pages = self.config.getint('ProjectInfo', 'max_pages', fallback=None)
+                max_retries = self.config.getint('ProjectInfo', 'max_retries', fallback=3)
                 api_key = self.config.get('API', 'gemini_api_key', fallback="")
 
                 startpromt = self.config.get('Startpromt', 'startpromt', fallback="")
             except: pass
+            
+        self.max_retries = max_retries
 
-        dialog = ProjectSettingsDialog(project_name, project_link, max_pages, api_key, startpromt, self)
+        dialog = ProjectSettingsDialog(project_name, project_link, max_pages, api_key, startpromt, gemini_version, self)
         if dialog.exec():
             updated_data = dialog.get_data()
             try:
+                if 'ProjectInfo' not in self.config:
+                    self.config['ProjectInfo'] = {}
                 self.config['ProjectInfo']['link'] = updated_data['link']
                 if updated_data['max_pages']: self.config['ProjectInfo']['max_pages'] = str(updated_data['max_pages'])
                 else: 
                      if 'max_pages' in self.config['ProjectInfo']: del self.config['ProjectInfo']['max_pages']
                      
+                self.config['ProjectInfo']['max_retries'] = str(updated_data['max_retries'])                     
                 
+                if 'API' not in self.config:
+                    self.config['API'] = {}
                 self.config['API']['gemini_api_key'] = updated_data['api_key']
+                
+                if 'Startpromt' not in self.config:
+                    self.config['Startpromt'] = {}
                 self.config['Startpromt']['startpromt'] = updated_data['Startpromt']  # Yeni başlangıç istemi
+                
                 with open(config_path, 'w', encoding='utf-8') as configfile:
                     self.config.write(configfile)
                 QMessageBox.information(self, "Ayarlar Kaydedildi", f"'{project_name}' projesinin ayarları başarıyla kaydedildi.")
@@ -1679,8 +1839,11 @@ class MainWindow(QMainWindow):
                           "Sürüm: 1.9.3 (Bölüm başlığı kontrolü getirildi.)\n"
                           "Sürüm: 1.9.4 (Çevirilecek dosya sayısının sınırlandırılması getirildi.)\n"
                           "Sürüm: 1.9.5 (Seçili dosyaların EPUB dosyası olarak kaydı sağlandı.)\n\n"
+                          "Sürüm: 1.9.6 (JS dosyalarını kaydetme özelliği eklendi.)\n\n"
+                          "Sürüm: 1.9.7 (Toplu bölüm ekleme özelliği eklendi.)\n\n"
+                          "Sürüm: 1.9.8 (Çalışmayı etkileyen genel hatalar giderildi.)\n\n"
                           "Geliştirici: UtkuCanC\n"
-                          "2025\n")
+                          "2026\n")
 
     def table_key_press_event(self, event):
         """QTableWidget'ta Enter tuşuna basıldığında vurgulanan satırları işaretler."""

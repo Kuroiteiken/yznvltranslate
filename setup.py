@@ -12,7 +12,8 @@ includes = [
     "token_counter",
     "utils",
     "temizlik",
-    "chapter_check_worker" # Yeni eklenen modül - Bölüm başlığı kontrolü için
+    "chapter_check_worker",
+    "split_worker" # Yeni eklenen modül - Toplu bölüm ekleme için
 ]
 
 # --- Harici Kütüphaneler ---
@@ -24,6 +25,8 @@ packages = [
     "configparser",
     "json",
     "re",
+    "selenium",
+    "webdriver_manager"
 ]
 
 # --- Dahil Edilecek Ek Dosyalar ---
@@ -68,7 +71,7 @@ executable = Executable(
 #python setup.py bdist_msi
 setup(
     name="NovelAlemCeviriAraci",
-    version="1.9.3", # Sürümünüz (main_window.py'den alındı)
+    version="1.9.8", 
     description="NovelAlem Çeviri Aracı",
     options={"build_exe": build_exe_options},
     executables=[executable]

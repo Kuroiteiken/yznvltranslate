@@ -5,14 +5,19 @@ __pycache__/
 
 # C extensions
 *.so
+## Bölüm - 509 ##
 
+## Bölüm - 529 ##
 # Distribution / packaging
+AppConfigs/
 .Python
 build/
 develop-eggs/
 dist/
 downloads/
 eggs/
+ayır.py
+test/
 .eggs/
 lib/
 lib64/

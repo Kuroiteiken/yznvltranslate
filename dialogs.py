@@ -4,7 +4,8 @@ import configparser
 from PyQt6.QtWidgets import (
     QDialog, QLineEdit, QFormLayout, QDialogButtonBox, 
     QMessageBox, QLabel, QApplication, QTextEdit, QListWidget, 
-    QVBoxLayout, QHBoxLayout, QPushButton, QComboBox, QInputDialog
+    QVBoxLayout, QHBoxLayout, QPushButton, QComboBox, QInputDialog,
+    QSpinBox
 )
 from PyQt6.QtGui import QIntValidator, QFont
 from PyQt6.QtCore import Qt
@@ -49,13 +50,31 @@ class GeminiVersionDialog(QDialog):
         self.version_combo = QComboBox()
         self.version_combo.setEditable(True) # Manuel girişe izin ver
         
-        # Bilinen modeller
-        models = [
-            "gemini-2.5-flash-preview-09-2025",
-            "gemini-1.5-flash",
-            "gemini-1.5-pro",
-            "gemini-1.0-pro"
-        ]
+        # API'den modelleri çekmeyi dene
+        models = []
+        try:
+            import google.generativeai as genai
+            keys_folder = get_config_path("APIKeys")
+            if os.path.exists(keys_folder):
+                api_keys = [f for f in os.listdir(keys_folder) if f.endswith('.txt')]
+                if api_keys:
+                    # İlk API anahtarını kullanarak modelleri çek
+                    key_path = os.path.join(keys_folder, api_keys[0])
+                    with open(key_path, 'r', encoding='utf-8') as f:
+                        api_key = f.read().strip()
+                    
+                    if api_key:
+                        genai.configure(api_key=api_key)
+                        for m in genai.list_models():
+                            if 'generateContent' in m.supported_generation_methods:
+                                name = m.name.replace("models/", "")
+                                models.append(name)
+        except Exception as e:
+            print(f"Model listesi çekilemedi: {e}")
+            
+        if not models:
+            models = ["Manuel giriş yapınız..."]
+            
         self.version_combo.addItems(models)
         
         # Mevcut ayarı yükle
@@ -206,6 +225,12 @@ class NewProjectDialog(QDialog):
         self.maxPagesInput = QLineEdit(self)
         self.maxPagesInput.setValidator(QIntValidator(1, 999999))
         
+        self.maxRetriesInput = QSpinBox(self)
+        self.maxRetriesInput.setMinimum(1)
+        self.maxRetriesInput.setMaximum(20)
+        self.maxRetriesInput.setValue(3)
+        self.maxRetriesInput.setToolTip("Bir API hatası alındığında (Örn. 500) tekrar deneme sayısı.")
+        
         # --- API Key Seçimi ---
         key_layout = QHBoxLayout()
         self.api_key_combo = QComboBox()
@@ -240,6 +265,7 @@ class NewProjectDialog(QDialog):
         layout.addRow("Proje Adı:", self.projectNameInput)
         layout.addRow("Proje Linki:", self.projectLinkInput)
         layout.addRow("Maksimum Sayfa:", self.maxPagesInput)
+        layout.addRow("Maksimum Deneme:", self.maxRetriesInput)
         layout.addRow("API Key Seç:", key_layout)
         layout.addRow("Seçili API Key:", self.api_key_input)
         layout.addRow("Promt Seç:", promt_layout)
@@ -279,12 +305,12 @@ class NewProjectDialog(QDialog):
     def get_data(self):
         max_pages_text = self.maxPagesInput.text()
         max_pages = int(max_pages_text) if max_pages_text.isdigit() else None
-        return self.projectNameInput.text(), self.projectLinkInput.text(), max_pages, self.api_key_input.text(), self.startpromtinput.toPlainText()
+        return self.projectNameInput.text(), self.projectLinkInput.text(), max_pages, self.maxRetriesInput.value(), self.api_key_input.text(), self.startpromtinput.toPlainText()
 
 
 class ProjectSettingsDialog(QDialog):
     """Mevcut proje ayarlarını düzenlemek için."""
-    def __init__(self, project_name, project_link, max_pages, api_key, start_promt, parent=None):
+    def __init__(self, project_name, project_link, max_pages, api_key, start_promt, gemini_version, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"'{project_name}' Ayarları")
         self.setMinimumWidth(500)
@@ -299,6 +325,13 @@ class ProjectSettingsDialog(QDialog):
         self.maxPagesInput = QLineEdit()
         if max_pages is not None:
             self.maxPagesInput.setText(str(max_pages))
+            
+        self.maxRetriesInput = QSpinBox()
+        self.maxRetriesInput.setMinimum(1)
+        self.maxRetriesInput.setMaximum(20)
+        # Handle older configs possibly not passing max_retries as kwargs properly yet. Default to 3.
+        self.maxRetriesInput.setValue(parent.max_retries if hasattr(parent, 'max_retries') else 3)
+        self.maxRetriesInput.setToolTip("Bir API hatası alındığında (Örn. 500) tekrar deneme sayısı.")
         
         # --- API Key Seçimi ---
         key_layout = QHBoxLayout()
@@ -314,7 +347,14 @@ class ProjectSettingsDialog(QDialog):
         
         key_layout.addWidget(self.api_key_combo, 1)
         key_layout.addWidget(self.edit_keys_btn)
-
+        # --- Gemini  Versiyon Gösterimi ---
+        gemini_layout = QHBoxLayout()
+        self.gemini_version_label = QLabel(f"Mevcut Versiyon:")
+        self.gemini_version_combo = QComboBox()
+        self.gemini_version_combo.setEditable(True)
+        self.gemini_version_combo.addItem(gemini_version)
+        self.gemini_version_combo.setCurrentText(gemini_version)
+        
         # --- Promt Seçimi ---
         promt_layout = QHBoxLayout()
         self.promt_combo = QComboBox()
@@ -332,6 +372,7 @@ class ProjectSettingsDialog(QDialog):
         layout.addRow("Proje Adı:", self.projectNameLabel)
         layout.addRow("Proje Linki:", self.projectLinkInput)
         layout.addRow("Maksimum Sayfa:", self.maxPagesInput)
+        layout.addRow("Maksimum Deneme:", self.maxRetriesInput)
         layout.addRow("API Key Seç:", key_layout)
         layout.addRow("Mevcut API Key:", self.api_key_input)
         layout.addRow("Promt Seç:", promt_layout)
@@ -375,6 +416,7 @@ class ProjectSettingsDialog(QDialog):
         return {
             "link": self.projectLinkInput.text(),
             "max_pages": max_pages,
+            "max_retries": self.maxRetriesInput.value(),
             "api_key": self.api_key_input.text(),
             "Startpromt": self.startpromtinput.toPlainText()
         }

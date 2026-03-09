@@ -12,8 +12,8 @@ class TranslationWorker(QObject):
     error = pyqtSignal(str) 
     progress = pyqtSignal(int, int) 
 
-    # __init__ metoduna file_limit eklendi
-    def __init__(self, input_folder, output_folder, api_key, startpromt, model_version="gemini-2.5-flash-preview-09-2025", file_limit=None):
+    # __init__ metoduna file_limit ve max_retries eklendi
+    def __init__(self, input_folder, output_folder, api_key, startpromt, model_version="gemini-2.5-flash-preview-09-2025", file_limit=None, max_retries=3):
         super().__init__()
         self.input_folder = input_folder
         self.output_folder = output_folder
@@ -21,6 +21,7 @@ class TranslationWorker(QObject):
         self.prompt_prefix = startpromt
         self.model_version = model_version
         self.file_limit = file_limit # Limiti kaydet
+        self.max_retries = max_retries # Retry sayısını kaydet
         self.is_running = True
         self.is_paused = False
         self.translation_errors = {}
@@ -97,11 +98,12 @@ class TranslationWorker(QObject):
                 full_prompt = self.prompt_prefix +"\n\n"+ content
                 
                 MAX_RETRIES = 3
-                retry_count = 0
                 translated_text = None
                 last_error = ""
+                api_limit_hit = False
+                retry_count = 0
 
-                while retry_count < MAX_RETRIES:
+                while retry_count < self.max_retries:
                     while self.is_paused and self.is_running:
                         time.sleep(0.5)
                         
@@ -125,16 +127,24 @@ class TranslationWorker(QObject):
                     
                     except Exception as e:
                         last_error = str(e)
-                        if ("500" in last_error) and retry_count < MAX_RETRIES - 1:
+                        if ("500" in last_error) and retry_count < self.max_retries - 1:
                             retry_count += 1
                             wait_time = 2 ** retry_count
                             sleep_start = time.time()
                             while time.time() - sleep_start < wait_time:
                                 if not self.is_running: break
                                 time.sleep(0.5)
-                        if ("429" in last_error) :
+                        elif ("429" in last_error) or ("ResourceExhausted" in last_error):
                             self.error.emit("API sınırına ulaşıldı. Lütfen bekleyin veya API kullanımınızı kontrol edin.")
-                            translated_count_session = self.file_limit  # Oturum limitini doldur
+                            api_limit_hit = True
+                            
+                            # Update logs so we know this file failed. We shouldn't drop a text file if we don't have translated string
+                            self.translation_errors[file_name] = f"Kota Aşıldı: {last_error}"
+                            try:
+                                with open(translated_file_path, 'w', encoding='utf-8') as f:
+                                    f.write(f"Çeviri hatası (Kota aşıldı): {last_error}\n\nOrijinal Metin:\n{content[:500]}...")
+                            except: pass
+                            
                             break
 
                         else:
@@ -145,6 +155,10 @@ class TranslationWorker(QObject):
                             except: pass
                             break
                 
+                # If API quota is exceeded, completely stop iterating through remaining files
+                if api_limit_hit:
+                    break
+                    
                 if not self.is_running:
                     break 
 

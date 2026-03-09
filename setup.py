@@ -57,7 +57,7 @@ build_exe_options = {
 # --- Platforma Özel Ayarlar ---
 base = None
 if sys.platform == "win32":
-    base = "Win32GUI"
+    base = "gui"
 
 # --- Yürütülebilir Dosya Tanımı ---
 executable = Executable(

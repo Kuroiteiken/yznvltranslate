@@ -98,9 +98,9 @@ class TerminologyManager:
 
     # ────────────────────── Otomatik Terim Çıkarma ──────────────────────
 
-    def needs_extraction(self) -> bool:
-        """Terim listesi boşsa True döner — otomatik çıkarma tetiklenmeli."""
-        return len(self.terms) == 0
+    def needs_extraction(self, min_terms: int = 5) -> bool:
+        """Terim listesi boşsa veya çok az terim varsa True döner — otomatik çıkarma tetiklenmeli."""
+        return len(self.terms) < min_terms
 
     def auto_extract_terms(self, sample_text: str, provider) -> int:
         """
@@ -118,10 +118,7 @@ class TerminologyManager:
             return 0
 
         try:
-            # Metin çok uzunsa kısalt (token limiti için)
-            truncated = sample_text[:8000]
-
-            prompt = EXTRACTION_PROMPT.format(sample_text=truncated)
+            prompt = EXTRACTION_PROMPT.format(sample_text=sample_text)
             app_logger.info("Otomatik terim çıkarma başlatıldı...")
 
             raw_response = provider.generate(prompt)
@@ -183,11 +180,18 @@ class TerminologyManager:
 
         return count
 
-    def get_sample_text_from_project(self, max_files: int = 3) -> str:
+    def get_sample_text_from_project(self, max_files: int = 5, token_limit: int = 10000) -> str:
         """
         Proje dwnld klasöründen ilk birkaç bölümün metnini toplar.
+        Token limiti aşılırsa dosya eklemeyi durdurur.
         Otomatik terim çıkarma için kullanılır.
         """
+        try:
+            from core.workers.token_counter import get_local_token_count_approx
+        except ImportError:
+            def get_local_token_count_approx(text):
+                return int(len(text) / 2.5)
+
         dwnld_folder = os.path.join(self.project_path, "dwnld")
         if not os.path.exists(dwnld_folder):
             return ""
@@ -197,12 +201,19 @@ class TerminologyManager:
             return ""
 
         samples = []
+        total_tokens = 0
         for f in files[:max_files]:
             try:
                 filepath = os.path.join(dwnld_folder, f)
                 with open(filepath, 'r', encoding='utf-8') as fh:
-                    content = fh.read()[:3000]  # Her dosyadan max 3000 karakter
-                    samples.append(content)
+                    content = fh.read()
+                file_tokens = get_local_token_count_approx(content)
+                if total_tokens + file_tokens > token_limit and samples:
+                    app_logger.info(f"Token limiti ({token_limit}) aşılacak, '{f}' eklenmedi.")
+                    break
+                samples.append(content)
+                total_tokens += file_tokens
+                app_logger.info(f"'{f}' örnekleme için eklendi. Toplam token: {total_tokens}")
             except Exception:
                 pass
 

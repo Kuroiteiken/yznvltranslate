@@ -6,6 +6,23 @@ from logger import app_logger
 TOKEN_DATA_FILENAME = "token_data.json"
 
 
+def get_local_token_count_approx(text):
+    """
+    Hızlı ve yerel token hesaplaması (Transformers AutoTokenizer ile).
+    Eğer kütüphane eksikse veya model yüklenmezse kabaca karakter sayısına göre tahmin yapar.
+    """
+    try:
+        from transformers import AutoTokenizer
+        # gpt2 tokenizer hızlı bir tahmin için oldukça yaygın ve küçüktür (ilk çağrıda inecektir).
+        # Proje CJK metinlerine (Çince/Korece vb) dayalıysa bile gpt2 token uzunluğu bir sınır belirlemek içindir.
+        tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        tokens = tokenizer.encode(text)
+        return len(tokens)
+    except Exception as e:
+        app_logger.warning(f"Yerel token hesaplama kullanılamıyor, yaklaşık hesap yapılıyor: {e}")
+        # Hızlı, çok yaklaşık hesap (1 token ~ 2.5 karakter CJK/Karışık için ortalama)
+        return int(len(text) / 2.5)
+
 def count_tokens_in_text(text, api_key=None, model_version="gemini-2.5-flash",
                          endpoint_id=None, endpoint_config=None):
     """
@@ -13,7 +30,7 @@ def count_tokens_in_text(text, api_key=None, model_version="gemini-2.5-flash",
     MCP entegrasyonu: LLMProvider üzerinden Gemini veya OpenAI-uyumlu servislerle çalışır.
     """
     try:
-        from llm_provider import LLMProvider
+        from core.llm_provider import LLMProvider
 
         # Provider oluştur
         if endpoint_config:
@@ -118,4 +135,4 @@ def save_token_data(config_folder_path, data):
         with open(token_data_path, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=4, ensure_ascii=False)
     except Exception as e:
-        print(f"Hata: Token kaydetme başarısız: {e}")
+        app_logger.error(f"Hata: Token kaydetme başarısız: {e}")

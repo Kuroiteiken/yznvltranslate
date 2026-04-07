@@ -1,11 +1,13 @@
 import logging
 import os
 import sys
+from logging.handlers import RotatingFileHandler
 
 def setup_logger(log_folder="AppConfigs", log_file="app.log"):
     """
     Uygulama genelinde kullanılacak merkezi log yapılandırmasını kurar.
-    Logs klasörü yoksa oluşturur. Dosyaya ve konsola çıktı verir.
+    Logs klasörü yoksa oluşturur. Dosyaya (RotatingFileHandler) ve konsola çıktı verir.
+    Log dosyası max 5MB, en fazla 3 yedek tutar.
     """
     # Klasör yoksa oluştur
     if not os.path.exists(log_folder):
@@ -22,7 +24,7 @@ def setup_logger(log_folder="AppConfigs", log_file="app.log"):
     
     # Hali hazırda handler varsa tekrar ekleme (çoklanmayı önlemek için)
     if not logger.handlers:
-        logger.setLevel(logging.DEBUG) # En düşük seviyede dinle
+        logger.setLevel(logging.DEBUG)  # En düşük seviyede dinle
 
         # Dosyaya yazılacak format (detaylı)
         file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s')
@@ -30,8 +32,14 @@ def setup_logger(log_folder="AppConfigs", log_file="app.log"):
         # Konsola yazdırılacak format (daha sade)
         console_formatter = logging.Formatter('%(levelname)s: %(message)s')
 
-        # Dosya Handler (AppConfigs/app.log dosyasına yazar)
-        file_handler = logging.FileHandler(log_path, mode='a', encoding='utf-8')
+        # Rotating Dosya Handler: max 5MB, 3 yedek (app.log, app.log.1, app.log.2, app.log.3)
+        file_handler = RotatingFileHandler(
+            log_path,
+            mode='a',
+            encoding='utf-8',
+            maxBytes=5 * 1024 * 1024,  # 5 MB
+            backupCount=3
+        )
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(file_formatter)
 

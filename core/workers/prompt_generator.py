@@ -52,30 +52,47 @@ class ContextBuilder:
         """Wiki metni varsa döndürür."""
         return wiki_text.strip() if wiki_text else ""
 
-    def get_sample_chapters(self) -> str:
-        """2+2+2 metodu ile bölüm örnekleri toplar."""
+    def get_sample_chapters(self, token_limit: int = None) -> tuple[str, int]:
+        """2+2+2 metodu ile bölüm örnekleri toplar. Token limiti aşılırsa durur."""
+        # token_limit verilmemişse app_settings.json'dan oku
+        if token_limit is None:
+            try:
+                import json as _json
+                _settings_file = os.path.join(os.getcwd(), "AppConfigs", "app_settings.json")
+                if os.path.exists(_settings_file):
+                    with open(_settings_file, "r", encoding="utf-8") as _f:
+                        _settings = _json.load(_f)
+                    token_limit = _settings.get("promt_generator_max_tokens", 40000)
+                else:
+                    token_limit = 40000
+            except Exception:
+                token_limit = 40000
+            app_logger.info(f"Prompt Gen token limiti ayarlardan okundu: {token_limit}")
+
+        try:
+            from core.workers.token_counter import get_local_token_count_approx
+        except ImportError:
+            def get_local_token_count_approx(text):
+                return int(len(text) / 2.5)
+
         dwnld_folder = os.path.join(self.project_path, "dwnld")
         if not os.path.exists(dwnld_folder):
-            return ""
+            return "", 0
 
         files = sorted([f for f in os.listdir(dwnld_folder) if f.endswith('.txt')])
         if not files:
-            return ""
+            return "", 0
 
         n = self.sample_count
         total = len(files)
 
         selected = []
-        # Baştan n
         selected.extend(files[:n])
-        # Ortadan n
         mid = total // 2
         mid_start = max(n, mid - n // 2)
         selected.extend(files[mid_start:mid_start + n])
-        # Sondan n
         selected.extend(files[max(0, total - n):])
 
-        # Tekrarları kaldır, sırayı koru
         seen = set()
         unique = []
         for f in selected:
@@ -84,19 +101,26 @@ class ContextBuilder:
                 unique.append(f)
 
         samples = []
+        acc_tokens = 0
         for f in unique:
             try:
                 with open(os.path.join(dwnld_folder, f), 'r', encoding='utf-8') as fh:
-                    content = fh.read()[:2000]  # Her dosyadan max 2000 karakter
-                    samples.append(f"--- {f} ---\n{content}")
+                    content = fh.read()
+                file_tokens = get_local_token_count_approx(content)
+                if acc_tokens + file_tokens > token_limit and samples:
+                    app_logger.info(f"Prompt örnekleme token limiti ({token_limit}) aşılacak, '{f}' atlandı.")
+                    continue
+                samples.append(f"--- {f} ---\n{content}")
+                acc_tokens += file_tokens
             except Exception:
                 pass
 
-        return "\n\n".join(samples)
+        return "\n\n".join(samples), acc_tokens
 
-    def build_context(self, wiki_text: str = "") -> str:
-        """Tam bağlam metni oluşturur."""
+    def build_context(self, wiki_text: str = "") -> tuple[str, int]:
+        """Tam bağlam metni oluşturur. (context, total_tokens) döndürür."""
         parts = []
+        total_tokens = 0
 
         prompts = self.get_saved_prompts()
         if prompts:
@@ -106,11 +130,12 @@ class ContextBuilder:
         if wiki:
             parts.append(f"## Hikaye Wiki / Karakter ve Evren Bilgileri:\n{wiki}")
 
-        samples = self.get_sample_chapters()
+        samples, sample_tokens = self.get_sample_chapters()
+        total_tokens += sample_tokens
         if samples:
             parts.append(f"## Hikaye Bölüm Örnekleri (Orijinal Dil):\n{samples}")
 
-        return "\n\n".join(parts)
+        return "\n\n".join(parts), total_tokens
 
 
 # ─────────────────────── Meta-Prompt ───────────────────────
@@ -177,7 +202,8 @@ class PromptGenWorker(QObject):
     def run(self):
         try:
             self.progress.emit("LLM sağlayıcı başlatılıyor...")
-            from llm_provider import LLMProvider
+            app_logger.info("LLM sağlayıcı başlatılıyor...")
+            from core.llm_provider import LLMProvider
 
             provider = None
 
@@ -204,6 +230,7 @@ class PromptGenWorker(QObject):
 
             info = provider.get_info()
             self.progress.emit(f"Prompt üretiliyor ({info['name']} — {info['model_id']})... Bu işlem 30-60 saniye sürebilir")
+            app_logger.info(f"Prompt üretiliyor ({info['name']} — {info['model_id']})... Bu işlem 30-60 saniye sürebilir")
 
             full_prompt = META_PROMPT_TEMPLATE.format(context=self.context)
             result = provider.generate(full_prompt)
@@ -237,10 +264,13 @@ def parse_generated_prompts(raw_text: str) -> dict:
                         prompts["C"] = c_part.strip()
     except Exception as e:
         app_logger.error(f"Prompt ayrıştırma hatası: {e}")
+        app_logger.error(f"Ayrıştırma hatası: {str(e)}")
 
     # Ayrıştırma başarısız ise ham metni A'ya koy
     if not any(prompts.values()):
         prompts["A"] = raw_text.strip()
+        QMessageBox.information(None, "Ayırma Başarısız!", "Prompt ayrıştırma başarısız, ham metin A promptuna kaydedildi.")
+        app_logger.error(f"Ayrıştırma başarısız, ham metin A promptuna kaydedildi.")
 
     return prompts
 
@@ -353,18 +383,24 @@ class PromptGeneratorDialog(QDialog):
         self.generate_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.progress_label.setText("Bağlam derleniyor...")
+        app_logger.info("Bağlam derleniyor...")
         QApplication.processEvents()
 
         # Bağlam oluştur
         builder = ContextBuilder(self.project_path, self.sample_spin.value())
-        context = builder.build_context(self.wiki_edit.toPlainText())
+        context, total_tokens = builder.build_context(self.wiki_edit.toPlainText())
 
         if not context.strip():
             QMessageBox.warning(self, "Uyarı", "Bağlam oluşturulamadı. Lütfen wiki bilgisi girin veya proje dosyalarını kontrol edin.")
+            app_logger.error("Bağlam oluşturulamadı. Lütfen wiki bilgisi girin veya proje dosyalarını kontrol edin.")
             self.generate_btn.setEnabled(True)
             self.progress_bar.setVisible(False)
             self.progress_label.clear()
             return
+
+        # Toplam örneklem token sayısını göster
+        self.progress_label.setText(f"📊 Örneklem hazırlandı: ~{total_tokens:,} token. LLM bağlantısı kuruluyor...")
+        app_logger.info(f"📊 Örneklem hazırlandı: ~{total_tokens:,} token. LLM bağlantısı kuruluyor...")
 
         # Model adını GVersion.ini'den oku
         import configparser
@@ -412,6 +448,7 @@ class PromptGeneratorDialog(QDialog):
     def on_generation_finished(self, raw_result):
         self.progress_bar.setVisible(False)
         self.progress_label.setText("Prompt üretimi tamamlandı!")
+        app_logger.info("Prompt üretimi tamamlandı!")
         self.generate_btn.setEnabled(True)
 
         self.generated_prompts = parse_generated_prompts(raw_result)
@@ -428,6 +465,7 @@ class PromptGeneratorDialog(QDialog):
         self.progress_label.setText(f"Hata: {msg}")
         self.generate_btn.setEnabled(True)
         QMessageBox.critical(self, "Prompt Üretim Hatası", msg)
+        app_logger.error(f"Prompt Üretim Hatası: {str(msg)}")
         self._cleanup_thread()
 
     def _cleanup_thread(self):

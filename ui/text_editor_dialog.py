@@ -9,8 +9,53 @@ from PyQt6.QtWidgets import (
     QPushButton, QMessageBox, QGroupBox, QComboBox, QStatusBar, QWidget
 )
 from PyQt6.QtGui import QFont, QShortcut, QKeySequence
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
 from logger import app_logger
+
+
+class RetranslateWorker(QObject):
+    """Tek bölüm tekrar çeviri işlemi için arka plan worker'."""
+    finished = pyqtSignal(str)   # translated text
+    error = pyqtSignal(str)
+
+    def __init__(self, project_path: str, original_path: str, startpromt: str, api_key: str):
+        super().__init__()
+        self.project_path = project_path
+        self.original_path = original_path
+        self.startpromt = startpromt
+        self.api_key = api_key
+
+    def run(self):
+        try:
+            with open(self.original_path, 'r', encoding='utf-8') as f:
+                original_content = f.read()
+
+            # Terminoloji entegrasyonu
+            terminology_section = ""
+            try:
+                from terminology.terminology_manager import TerminologyManager
+                tm = TerminologyManager(self.project_path)
+                terminology_section = tm.build_prompt_section()
+                if terminology_section:
+                    app_logger.info("Tekrar çeviri için terminoloji bölümü eklendi.")
+            except Exception as te:
+                app_logger.warning(f"Terminoloji yüklenemedi: {te}")
+
+            from core.llm_provider import create_provider_from_config
+            provider = create_provider_from_config(self.project_path, self.api_key)
+
+            full_prompt = self.startpromt
+            if terminology_section:
+                full_prompt += "\n\n" + terminology_section
+            full_prompt += "\n\n" + original_content
+
+            translated = provider.generate(full_prompt)
+            if translated:
+                self.finished.emit(translated)
+            else:
+                self.error.emit("API bolunanı yanit döndürmedi.")
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 class TextEditorDialog(QDialog):
@@ -141,12 +186,11 @@ class TextEditorDialog(QDialog):
             QMessageBox.critical(self, "Kayıt Hatası", f"Dosya kaydedilemedi: {e}")
 
     def retranslate_chapter(self):
-        """Tek bölümü tekrar çevirir."""
+        """Tek bölümü arka planda (QThread) tekrar çevirir — terminoloji entegre."""
         if not self.project_path:
             QMessageBox.warning(self, "Uyarı", "Proje yolu belirlenmemiş.")
             return
 
-        # Kayıtlı mı kontrol et
         if self.has_unsaved_changes:
             reply = QMessageBox.question(
                 self, "Kaydet",
@@ -158,7 +202,6 @@ class TextEditorDialog(QDialog):
             elif reply == QMessageBox.StandardButton.Cancel:
                 return
 
-        # Orijinal dosyayı bul
         file_name = os.path.basename(self.file_path)
         if file_name.startswith("translated_"):
             original_name = file_name.replace("translated_", "", 1)
@@ -170,7 +213,6 @@ class TextEditorDialog(QDialog):
             QMessageBox.warning(self, "Orijinal Dosya Yok", f"Orijinal dosya bulunamadı:\n{original_path}")
             return
 
-        # Basit tek dosya çevirisi
         try:
             import configparser
             config = configparser.ConfigParser()
@@ -186,31 +228,46 @@ class TextEditorDialog(QDialog):
                 QMessageBox.warning(self, "API Anahtarı Yok", "Proje ayarlarında API anahtarı tanımlı değil.")
                 return
 
-            with open(original_path, 'r', encoding='utf-8') as f:
-                original_content = f.read()
-
-            from llm_provider import LLMProvider, create_provider_from_config
-            provider = create_provider_from_config(self.project_path, api_key)
-
             self.retranslate_btn.setEnabled(False)
-            self.retranslate_btn.setText("Çevriliyor...")
-            from PyQt6.QtWidgets import QApplication
-            QApplication.processEvents()
+            self.retranslate_btn.setText("⏳ Çevriliyor...")
 
-            full_prompt = startpromt + "\n\n" + original_content
-            translated = provider.generate(full_prompt)
+            self._retranslate_thread = QThread()
+            self._retranslate_worker = RetranslateWorker(self.project_path, original_path, startpromt, api_key)
+            self._retranslate_worker.moveToThread(self._retranslate_thread)
 
-            if translated:
-                self.text_edit.setPlainText(translated)
-                self.has_unsaved_changes = True
-                self.change_indicator.setText("● Yeni çeviri — kaydedin")
-                QMessageBox.information(self, "Çeviri Tamamlandı", "Bölüm başarıyla tekrar çevrildi.")
+            self._retranslate_thread.started.connect(self._retranslate_worker.run)
+            self._retranslate_worker.finished.connect(self._on_retranslate_done)
+            self._retranslate_worker.error.connect(self._on_retranslate_error)
+            self._retranslate_worker.finished.connect(self._retranslate_thread.quit)
+            self._retranslate_worker.error.connect(self._retranslate_thread.quit)
+            self._retranslate_thread.finished.connect(self._retranslate_thread.deleteLater)
+
+            self._retranslate_thread.start()
 
         except Exception as e:
-            QMessageBox.critical(self, "Çeviri Hatası", f"Tekrar çeviri sırasında hata:\n{e}")
-        finally:
+            QMessageBox.critical(self, "Çeviri Hatası", f"Tekrar çeviri başlatılamadı:\n{e}")
             self.retranslate_btn.setEnabled(True)
             self.retranslate_btn.setText("🔄 Tekrar Çevir")
+
+    def _on_retranslate_done(self, translated: str):
+        """Arka plan çevirisi tamamlandığında çağrılır."""
+        self.text_edit.setPlainText(translated)
+        self.has_unsaved_changes = True
+        self.change_indicator.setText("● Yeni çeviri — kaydedin")
+        QMessageBox.information(self, "Çeviri Tamamlandı", "Bölüm başarıyla tekrar çevrildi.\nTerminoloji kuralları uygulandı.")
+        self.retranslate_btn.setEnabled(True)
+        self.retranslate_btn.setText("🔄 Tekrar Çevir")
+        self._retranslate_worker = None
+        self._retranslate_thread = None
+
+    def _on_retranslate_error(self, msg: str):
+        """Arka plan çevirisi hata verdiğinde çağrılır."""
+        QMessageBox.critical(self, "Çeviri Hatası", f"Tekrar çeviri sırasında hata:\n{msg}")
+        self.retranslate_btn.setEnabled(True)
+        self.retranslate_btn.setText("🔄 Tekrar Çevir")
+        self._retranslate_worker = None
+        self._retranslate_thread = None
+
 
     def closeEvent(self, event):
         """Kapatma sırasında değişiklik kontrolü."""

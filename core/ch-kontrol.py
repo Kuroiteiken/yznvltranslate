@@ -1,4 +1,5 @@
 import os
+from logger import app_logger
 
 def cince_karakter_say(metin):
     """
@@ -7,9 +8,7 @@ def cince_karakter_say(metin):
     sayac = 0
     for karakter in metin:
         # Standart Çince karakter Unicode aralığı: 4E00 - 9FFF
-        if ('\uac00' <= karakter <= '\ud7a3') or \
-           ('\u1100' <= karakter <= '\u11ff') or \
-           ('\u3130' <= karakter <= '\u318f'):
+        if '\u4e00' <= karakter <= '\u9fff':
             sayac += 1
     if sayac > 100:
         return sayac
@@ -22,10 +21,10 @@ def klasoru_tara(klasor_yolu):
     Belirtilen klasördeki txt dosyalarını bulur ve Çince karakter sayılarını raporlar.
     """
     if not os.path.exists(klasor_yolu):
-        print(f"Hata: '{klasor_yolu}' yolu bulunamadı.")
+        app_logger.error(f"Hata: '{klasor_yolu}' yolu bulunamadı.")
         return
 
-    print(f"--- '{klasor_yolu}' klasörü taranıyor ---\n")
+    app_logger.info(f"--- '{klasor_yolu}' klasörü taranıyor --- Çince Kontrol ---")
     silinecek_list = []
     toplam_dosya = 0
     sorunsuz_dosya = 0
@@ -44,8 +43,8 @@ def klasoru_tara(klasor_yolu):
                     if sayi > 1000:
                         #print(dosya_tam_yolu)
                         #print(dosya_yolu)
-                        print(f"Dosya: {dosya_adi} -> Çince Karakter Sayısı: {sayi}")
-                        print(f"Dosya: {dosya_adi} -> Silindi")
+                        app_logger.info(f"Dosya: {dosya_adi} -> Çince Karakter Sayısı: {sayi}")
+                        app_logger.info(f"Dosya: {dosya_adi} -> Silindi")
                         sorunlu_dosya += 1
 #                        os.remove(dosya_tam_yolu)
                         silinecek_list.append(dosya_tam_yolu)
@@ -53,19 +52,19 @@ def klasoru_tara(klasor_yolu):
                         
                         
                     if 0 <sayi <1000:
-                        print(f"Dosya: {dosya_adi} -> Çince Karakter Sayısı: {sayi}")
+                        app_logger.info(f"Dosya: {dosya_adi} -> Çince Karakter Sayısı: {sayi}")
                     else:
                         sorunsuz_dosya += 1
                     
             except Exception as e:
-                print(f"Hata: {dosya_adi} okunamadı. Sebebi: {e}")
+                app_logger.error(f"Hata: {dosya_adi} okunamadı. Sebebi: {e}")
     
     if toplam_dosya == 0:
-        print("Klasörde hiç .txt dosyası bulunamadı.")
+        app_logger.info("Klasörde hiç .txt dosyası bulunamadı.")
     else:
-        print(f"Sorunlu Dosya Sayısı {sorunlu_dosya} .")
-        print(f"Sorunsuz Dosya Sayısı {sorunsuz_dosya} .")
-        print(f"Toplam Dosya Sayısı {toplam_dosya} .")
+        app_logger.info(f"Sorunlu Dosya Sayısı {sorunlu_dosya} .")
+        app_logger.info(f"Sorunsuz Dosya Sayısı {sorunsuz_dosya} .")
+        app_logger.info(f"Toplam Dosya Sayısı {toplam_dosya} .")
     return silinecek_list
 
 def dosya_sil(dosya_list):
@@ -73,7 +72,7 @@ def dosya_sil(dosya_list):
     for dosya_yol in dosya_list:
         os.remove(dosya_list[say])
         say = say + 1
-    print("Silme Tamamlandı")
+    app_logger.info("Silme Tamamlandı")
 # --- KULLANIM ---
 # Aşağıdaki yolu kendi klasör yolunuzla değiştirin.
 # Windows örneği: r"C:\Kullanicilar\Belgelerim\Dosyalar"

@@ -9,6 +9,7 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 from logger import app_logger
+import datetime
 
 class DownloadWorker(QObject):
     """
@@ -35,7 +36,6 @@ class DownloadWorker(QObject):
     def run(self):
         """İndirme işlemini başlatan ana fonksiyon."""
         app_logger.info(f"İndirme işlemi başlatılıyor: {self.base_url}")
-        print(f"DEBUG: Ana URL -> {self.base_url}")
         if self.js_script_path and os.path.exists(self.js_script_path):
             self._run_selenium()
         else:
@@ -45,7 +45,6 @@ class DownloadWorker(QObject):
         """JS kodlarını Selenium üzerinden çalıştırarak indirir."""
         driver = None
         app_logger.info("Selenium işçisi başlatıldı.")
-        print("INFO: Selenium süreci başlıyor...")
         try:
             self.progress.emit(0, 100)
             self.status_message.emit("Tarayıcı hazırlanıyor...")
@@ -78,13 +77,12 @@ class DownloadWorker(QObject):
             
             # Kullanıcının menüden bir seçenek seçmesini bekle
             self.status_message.emit("Kullanıcı seçimi bekleniyor (Panelden seçim yapın)...")
-            print("Kullanıcı etkileşimi bekleniyor...")
+            app_logger.info("Kullanıcı etkileşimi bekleniyor...")
             while self.selenium_command is None and self.is_running:
                 time.sleep(1)
             
             if not self.is_running or self.selenium_command == "cancel":
                 app_logger.warning("İndirme iptal edildi.")
-                print("İndirme iptal edildi.")
                 return
 
             # Seçilen JS dosyasını belirle
@@ -136,40 +134,62 @@ class DownloadWorker(QObject):
             app_logger.info("Script çalıştırıldı, loglar dinleniyor...")
 
             # Dosyanın inmesini bekle + Logları Dinle
-            wait_time = 0
-            max_wait_time = 1800 # 30 dakika (büyük romanlar için)
+            # Süre sınırı yok — dosya inene veya kullanıcı durdurana kadar bekle
+            elapsed_time = 0
             downloaded_file = None
-            
-            while wait_time < max_wait_time and self.is_running:
+            LOG_PROGRESS_INTERVAL = 60  # Her 60 saniyede bir ilerleme logu
+            next_log_at = LOG_PROGRESS_INTERVAL
+
+            while self.is_running:
+                # Tarayıcının hâlâ ayakta olup olmadığını kontrol et
+                try:
+                    _ = driver.window_handles  # Tarayıcı kapandıysa exception fırlatır
+                except Exception as browser_closed_err:
+                    error_msg = (
+                        f"Tarayıcı beklenmedik şekilde kapandı (indirme tamamlanmadı). "
+                        f"Sebep: {browser_closed_err}"
+                    )
+                    app_logger.error(error_msg)
+                    self.error.emit(error_msg)
+                    return
+
                 # Browser loglarını kontrol et
+                now = datetime.datetime.now()
                 try:
                     logs = driver.get_log('browser')
                     for entry in logs:
                         msg = entry.get('message', '')
                         # console.log çıktılarını yakala
                         if '📄' in msg or 'bölüm' in msg.lower():
-                            # Chrome logları genellikle string içindedir, temizleyelim
                             clean_msg = msg.split('"')[-2] if '"' in msg else msg
-                            print(f"BROWSER: {clean_msg}")
                             self.status_message.emit(clean_msg)
-                            app_logger.info(f"JS Progress: {clean_msg}")
+                            app_logger.info(f"Time: {now} - JS Progress: {clean_msg}")
                 except Exception as log_err:
-                    print(f"Log okuma hatası: {log_err}")
+                    app_logger.debug(f"Log okuma hatası: {log_err}")
 
                 # Dosya kontrolü
                 current_files = set(f for f in os.listdir(self.download_folder) if f.endswith('.txt'))
                 new_files = current_files - existing_files
-                
+
                 if new_files:
                     downloaded_file = list(new_files)[0]
                     app_logger.info(f"Yeni dosya tespit edildi: {downloaded_file}")
                     break
-                    
-                time.sleep(3) # Logları kaçırmamak ve CPU yormamak için ideal
-                wait_time += 3
-                
-                simulated_progress = min(98, 60 + int((wait_time / max_wait_time) * 38))
+
+                time.sleep(3)  # Logları kaçırmamak ve CPU yormamak için
+                elapsed_time += 3
+
+                # Simüle ilerleme (60-%98 arasında, yavaş artış)
+                simulated_progress = min(98, 60 + int((elapsed_time / 3600) * 38))
                 self.progress.emit(simulated_progress, 100)
+
+                # Periyodik durum logu
+                if elapsed_time >= next_log_at:
+                    app_logger.info(
+                        f"İndirme devam ediyor... Geçen süre: {elapsed_time // 60} dk "
+                        f"{elapsed_time % 60} sn"
+                    )
+                    next_log_at += LOG_PROGRESS_INTERVAL
 
             if not self.is_running:
                 app_logger.warning("Durma sinyali alındı, döngüden çıkılıyor.")
@@ -182,19 +202,22 @@ class DownloadWorker(QObject):
                 app_logger.info(f"İşlem başarılı: {full_path}")
                 self.file_downloaded.emit(full_path, downloaded_file)
             else:
-                msg = "Zaman aşımı: İndirme algılanamadı."
-                app_logger.error(msg)
-                self.error.emit(msg)
+                # Bu noktaya normalde ulaşılmamalı; ulaşılırsa hata bildir
+                error_msg = "İndirme döngüsü tamamlandı ancak yeni dosya tespit edilemedi."
+                app_logger.error(error_msg)
+                self.error.emit(error_msg)
 
         except Exception as e:
             app_logger.critical(f"Kritik Selenium Hatası: {str(e)}", exc_info=True)
             self.error.emit(f"Selenium Hatası: {str(e)}")
         finally:
             if driver:
-                print("Tarayıcı kapatılıyor...")
-                driver.quit()
+                try:
+                    app_logger.info("Tarayıcı kapatılıyor...")
+                    driver.quit()
+                except Exception:
+                    pass  # Tarayıcı zaten kapanmış olabilir
             self.finished.emit()
-            print("Selenium işçisi tamamlandı/durduruldu.")
             app_logger.info("Selenium işçisi oturumu kapattı.")
 
 
@@ -211,7 +234,7 @@ class DownloadWorker(QObject):
             
             while self.is_running:
                 if self.max_pages and self.downloaded_pages >= self.max_pages:
-                    print("Maksimum sayfa sayısına ulaşıldı.")
+                    app_logger.info("Maksimum sayfa sayısına ulaşıldı.")
                     break
 
                 time.sleep(1) # Siteye saygılı olmak için bekleme süresi (ayarlanabilir)
@@ -249,8 +272,7 @@ class DownloadWorker(QObject):
                     self.file_downloaded.emit(full_path, page_filename)
                     self.progress.emit(self.downloaded_pages, self.max_pages if self.max_pages else 0) # İlerleme sinyali
                 else:
-                    print(f"Uyarı: İçerik bulunamadı! URL: {current_url}. Belki de sayfa yapısı değişti.")
-                    # İçerik bulunamazsa yine de sonraki sayfaya geçmeye çalışabiliriz
+                    app_logger.warning(f"İçerik bulunamadı. URL: {current_url}")
                     
                 # Sonraki sayfa düğmesini bulmak için daha esnek bir arama
                 next_button = soup.find(lambda tag: tag.name == 'a' and ('下一章' in tag.text or 'next' in tag.text.lower() or 'ileri' in tag.text.lower() or "다음화 보기" in tag.text.lower()) or "다음화" in tag.text.lower())
@@ -266,9 +288,9 @@ class DownloadWorker(QObject):
             self.error.emit(str(e))
         finally:
             self.finished.emit()
-            print("İndirme işçisi tamamlandı/durduruldu.")
+            app_logger.info("Standart indirme işçisi tamamlandı/durduruldu.")
 
     def stop(self):
         """İndirme döngüsünü durdurur."""
         self.is_running = False
-        print("İndirme işçisi durdurma isteği aldı.")
+        app_logger.info("İndirme işçisi durdurma isteği aldı.")

@@ -1,206 +1,47 @@
 import sys
 import os
-import copy
 import configparser
-import json
-import re
-import shutil
-import subprocess
 import time
 from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QMenuBar, QListWidget, 
-    QTableWidget, QTableWidgetItem, QPushButton, QHBoxLayout, 
-    QVBoxLayout, QHeaderView, QCheckBox, QSizePolicy,QComboBox,QLineEdit,
-    QMessageBox, QProgressBar, QLabel, QMenu, QSpinBox, QFileDialog
+    QApplication, QMainWindow, QWidget, QListWidget,
+    QTableWidget, QTableWidgetItem, QHBoxLayout,
+    QVBoxLayout, QHeaderView, QSizePolicy, QLineEdit,
+    QMessageBox, QPushButton, QLabel
 )
-from PyQt6.QtGui import QFont, QColor, QAction, QIcon
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer
+from PyQt6.QtGui import QFont, QIcon, QDesktopServices 
+from PyQt6.QtCore import Qt, QUrl
 
 # Kendi oluşturduğumuz modülleri içe aktarıyoruz
-#python -m PyInstaller --onefile --windowed main_window.py
-from dialogs import NewProjectDialog, ProjectSettingsDialog, PromptEditorDialog, ApiKeyEditorDialog, GeminiVersionDialog, MCPServerDialog, TerminologyDialog, SeleniumMenuDialog
-from download_worker import DownloadWorker
-from translation_worker import TranslationWorker
-from cleaning_worker import CleaningWorker
-from merging_worker import MergingWorker
-from token_counter import count_tokens_in_file, load_token_data, save_token_data 
-from utils import format_file_size, natural_sort_key
-from chapter_check_worker import ChapterCheckWorker
-from translation_error_check_worker import TranslationErrorCheckWorker
-from text_editor_dialog import TextEditorDialog
-from epub_worker import EpubWorker
-from split_worker import SplitWorker
+from dialogs import (
+    NewProjectDialog, ProjectSettingsDialog, PromptEditorDialog,
+    ApiKeyEditorDialog, GeminiVersionDialog, MCPServerDialog,
+    TerminologyDialog, SeleniumMenuDialog
+)
+from core.workers.token_counter import load_token_data, save_token_data
 from logger import app_logger
-from request_counter_manager import RequestCounterManager
+from ui.request_counter_manager import RequestCounterManager
+from ui.app_settings_dialog import AppSettingsDialog, load_app_settings, apply_theme
+from ui.menu_bar_builder import build_menu_bar
+from ui.right_panel_builder import build_right_panel
+from ui.status_bar_manager import StatusBarManager
+from ui.file_table_interactions import FileTableInteractions
+from ui.api_stats_dialog import show_api_stats_dialog
+from core.download_controller import DownloadController
+from core.translation_controller import TranslationController
+from core.merge_controller import MergeController
+from core.token_controller import TokenController
+from core.process_controller import (
+    CleaningController, SplitController, EpubController,
+    ErrorCheckController, ChapterCheckController, MLTerminologyController
+)
 
-class TokenCountWorker(QObject):
-    finished = pyqtSignal(dict) # Tüm token verilerini döndür
-    progress = pyqtSignal(int, int) # Current file index, total files
-    error = pyqtSignal(str)
-
-    def __init__(self, project_path, api_key, current_token_cache, model_version, selected_files=None, endpoint_id=None):
-        super().__init__()
-        self.project_path = project_path
-        self.api_key = api_key
-        self.is_running = True
-        self.current_token_cache = current_token_cache # Mevcut önbellek (dict)
-        self.model_version = model_version
-        self.selected_files = selected_files
-        self.endpoint_id = endpoint_id
-        # Mevcut önbellekten derin kopya al — önceki token kayıtlarını korumak için
-        if current_token_cache and "file_token_data" in current_token_cache:
-            self.token_data_to_save = copy.deepcopy(current_token_cache)
-        else:
-            self.token_data_to_save = {"file_token_data": {}, "total_original_tokens": 0, "total_translated_tokens": 0, "total_combined_tokens": 0}
-
-
-    def run(self):
-        app_logger.info(f"TokenCountWorker başlatıldı. Proje: {self.project_path}")
-        original_folder = os.path.join(self.project_path, 'dwnld')
-        translated_folder = os.path.join(self.project_path, 'trslt')
-        completed_folder = os.path.join(self.project_path, 'cmplt')
-
-        total_original_tokens_sum = 0
-        total_translated_tokens_sum = 0
-        
-        # Dosya listelerini oluştur
-        original_files = sorted([f for f in os.listdir(original_folder) if f.endswith('.txt')]) if os.path.exists(original_folder) else []
-        translated_files = sorted([f for f in os.listdir(translated_folder) if f.startswith('translated_') and f.endswith('.txt')]) if os.path.exists(translated_folder) else []
-        merged_files = sorted([f for f in os.listdir(completed_folder) if f.startswith('merged_') and f.endswith('.txt')]) if os.path.exists(completed_folder) else []
-
-        all_relevant_files = [] # {filename, path, type (original/translated/merged)}
-        for f in original_files:
-            if self.selected_files and f not in self.selected_files: continue
-            all_relevant_files.append({'name': f, 'path': os.path.join(original_folder, f), 'type': 'original'})
-        for f in translated_files:
-            if self.selected_files and f not in self.selected_files: continue
-            all_relevant_files.append({'name': f, 'path': os.path.join(translated_folder, f), 'type': 'translated'})
-        for f in merged_files:
-            if self.selected_files and f not in self.selected_files: continue
-            all_relevant_files.append({'name': f, 'path': os.path.join(completed_folder, f), 'type': 'merged'})
-        
-        total_files_to_check = len(all_relevant_files)
-        processed_count = 0
-        app_logger.info(f"Token sayılacak dosya sayısı: {total_files_to_check}")
-
-        # Her bir dosyayı işle
-        for file_info in all_relevant_files:
-            if not self.is_running: 
-                app_logger.info("TokenCountWorker durduruldu, döngüden çıkılıyor.")
-                break
-
-            file_name = file_info['name']
-            file_path = file_info['path']
-            file_type = file_info['type']
-            app_logger.debug(f"[{processed_count+1}/{total_files_to_check}] İşleniyor: {file_name} ({file_type})")
-            
-            # Önbellekte dosya verisini ara
-            cached_data = self.current_token_cache.get("file_token_data", {}).get(file_name)
-            
-            current_mtime = os.path.getmtime(file_path) # Mevcut değiştirme zamanı
-            
-            token_count = None
-            should_recount = True
-
-            if cached_data:
-                # Cache'de mtime kontrolü yap
-                if file_type == 'original' and cached_data.get('original_mtime') == current_mtime:
-                    token_count = cached_data.get('original_tokens')
-                    should_recount = False
-                elif file_type == 'translated' and cached_data.get('translated_mtime') == current_mtime:
-                    token_count = cached_data.get('translated_tokens')
-                    should_recount = False
-                elif file_type == 'merged' and cached_data.get('merged_mtime') == current_mtime:
-                    token_count = cached_data.get('merged_tokens')
-                    should_recount = False
-
-                if not should_recount:
-                    app_logger.debug(f"'{file_name}' için önbellekteki değer kullanılıyor: {token_count}")
-            
-            if should_recount:
-                app_logger.debug(f"'{file_name}' için API çağrısı yapılıyor...")
-                tokens, err = count_tokens_in_file(file_path, self.api_key, self.model_version, endpoint_id=self.endpoint_id)
-                if tokens is not None:
-                    token_count = tokens
-                    app_logger.debug(f"'{file_name}' token sayımı tamamlandı: {tokens}")
-                else:
-                    app_logger.error(f"Token sayım hatası ({file_name}): {err}")
-            
-            # Sonuçları işçi verisine kaydet
-            if file_name not in self.token_data_to_save["file_token_data"]:
-                self.token_data_to_save["file_token_data"][file_name] = {
-                    "original_tokens": None, "original_mtime": None,
-                    "translated_tokens": None, "translated_mtime": None,
-                    "merged_tokens": None, "merged_mtime": None
-                }
-            
-            if file_type == 'original':
-                self.token_data_to_save["file_token_data"][file_name]["original_tokens"] = token_count
-                self.token_data_to_save["file_token_data"][file_name]["original_mtime"] = current_mtime
-                if token_count is not None:
-                    total_original_tokens_sum += token_count
-            elif file_type == 'translated':
-                self.token_data_to_save["file_token_data"][file_name]["translated_tokens"] = token_count
-                self.token_data_to_save["file_token_data"][file_name]["translated_mtime"] = current_mtime
-                if token_count is not None:
-                    total_translated_tokens_sum += token_count
-            elif file_type == 'merged':
-                self.token_data_to_save["file_token_data"][file_name]["merged_tokens"] = token_count
-                self.token_data_to_save["file_token_data"][file_name]["merged_mtime"] = current_mtime
-
-            processed_count += 1
-            self.progress.emit(processed_count, total_files_to_check)
-        
-        app_logger.info("Tüm dosyalar işlendi. finished sinyali yayınlanıyor...")
-
-        # Toplam tokenleri TÜM kayıtlardan yeniden hesapla (sadece seçili dosyalar değil)
-        # Böylece önceki sayımlar dahil doğru genel toplam elde edilir
-        grand_original = 0
-        grand_translated = 0
-        for fname, fdata in self.token_data_to_save["file_token_data"].items():
-            orig = fdata.get("original_tokens")
-            trans = fdata.get("translated_tokens")
-            if orig is not None:
-                grand_original += orig
-            if trans is not None:
-                grand_translated += trans
-
-        self.token_data_to_save["total_original_tokens"] = grand_original
-        self.token_data_to_save["total_translated_tokens"] = grand_translated
-        self.token_data_to_save["total_combined_tokens"] = grand_original + grand_translated
-
-        self.finished.emit(self.token_data_to_save)
-        app_logger.info("finished sinyali yayınlandı.")
-    
-    def stop(self):
-        self.is_running = False
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Novel Çeviri Aracı V2.0.0")
+        self.setWindowTitle("Novel Çeviri Aracı V2.1.0")
         self.setWindowIcon(QIcon("logo256.ico"))
-        self.setGeometry(100, 100, 1400, 800) # Pencere boyutu büyütüldü
-        
-        # İş parçacığı referansları
-        self.download_thread = None
-        self.download_worker = None
-        self.translation_thread = None
-        self.translation_worker = None
-        self.cleaning_thread = None
-        self.cleaning_worker = None
-        self.merging_thread = None
-        self.merging_worker = None
-        self.token_count_thread = None 
-        self.token_count_worker = None
-        self.chapter_check_thread = None
-        self.chapter_check_worker = None
-        self.error_check_thread = None
-        self.error_check_worker = None
-        self.epub_thread = None
-        self.epub_worker = None
-        self.split_thread = None
-        self.split_worker = None
+        self.setGeometry(100, 100, 1400, 800)
 
         # İstatistikler (status bar için)
         self.request_counter_manager = RequestCounterManager()
@@ -209,36 +50,62 @@ class MainWindow(QMainWindow):
         self._current_model = self.get_gemini_model_version()
         self._current_api_name = ""
         self._current_status = "Hazır"
-
         self._ensure_app_structure()
-        self.current_project_path = None 
-        self.config = configparser.ConfigParser() 
+        self.current_project_path = None
+        self.config = configparser.ConfigParser()
         self.project_token_cache = {}
 
+        # ── Controller'ları oluştur ──
+        self.download_ctrl = DownloadController(self)
+        self.translation_ctrl = TranslationController(self)
+        self.merge_ctrl = MergeController(self)
+        self.token_ctrl = TokenController(self)
+        self.cleaning_ctrl = CleaningController(self)
+        self.split_ctrl = SplitController(self)
+        self.epub_ctrl = EpubController(self)
+        self.error_check_ctrl = ErrorCheckController(self)
+        self.chapter_check_ctrl = ChapterCheckController(self)
+        self.ml_terminology_ctrl = MLTerminologyController(self)
+
+        # ── UI oluştur ──
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
-        # Ana layout: üst kısım + alt bilgi barı
         self.outer_layout = QVBoxLayout(self.central_widget)
         self.main_layout = QHBoxLayout()
         self.outer_layout.addLayout(self.main_layout, 1)
 
-        self._create_menu_bar()
+        # FileTableInteractions erken oluşturulmalı (paneller referans ediyor)
+        self.file_table_interactions = FileTableInteractions(self)
+
+        build_menu_bar(self)
         self._create_left_panel()
         self._create_center_panel()
-        self._create_right_panel()
-        self._create_status_bar()
+        build_right_panel(self)
 
-        self.load_existing_projects() 
-        
-        # QTableWidget için keyPressEvent'i yakala
-        self.file_table.keyPressEvent = self.table_key_press_event
+        # Tablo etkileşimlerini bağla (file_table artık mevcut)
+        self.file_table_interactions.setup()
 
-        # Token sayma işlemi için UI elemanlarını başlangıçta gizle
+        self.status_bar_mgr = StatusBarManager(self)
+        self.status_bar_mgr.create()
+
+        self.load_existing_projects()
+
+        # Başlangıç durumları
         self.total_tokens_label.setVisible(False)
         self.total_original_tokens_label.setVisible(False)
         self.total_translated_tokens_label.setVisible(False)
         self.token_progress_bar.setVisible(False)
-        self.token_count_button.setEnabled(False) # Başlangıçta pasif
+        self.token_count_button.setEnabled(False)
+
+        # Tema uygula
+        app_settings = load_app_settings()
+        apply_theme(QApplication.instance(), app_settings.get("theme", "dark"))
+
+        # Sistem tray
+        self._tray_icon = None
+        self._setup_tray_icon()
+
+    # ─────────────── Uygulama Yapısı ───────────────
     def _ensure_app_structure(self):
         base_path = os.getcwd()
         paths = [
@@ -249,21 +116,19 @@ class MainWindow(QMainWindow):
         ]
         try:
             for p in paths:
-                if not os.path.exists(p): os.makedirs(p)
+                if not os.path.exists(p):
+                    os.makedirs(p)
         except Exception as e:
             QMessageBox.critical(self, "Hata", f"Klasör yapısı oluşturulamadı: {e}")
-        
-        # MCP_Endpoints.json yoksa varsayılan oluştur
         mcp_file = os.path.join(base_path, "AppConfigs", "MCP_Endpoints.json")
         if not os.path.exists(mcp_file):
             try:
-                from llm_provider import save_endpoints, DEFAULT_ENDPOINTS
+                from core.llm_provider import save_endpoints, DEFAULT_ENDPOINTS
                 save_endpoints(DEFAULT_ENDPOINTS)
             except Exception:
                 pass
 
     def get_gemini_model_version(self):
-        """AppConfigs/GVersion.ini dosyasından versiyonu okur."""
         base_path = os.getcwd()
         config_path = os.path.join(base_path, "AppConfigs", "GVersion.ini")
         config = configparser.ConfigParser()
@@ -271,110 +136,23 @@ class MainWindow(QMainWindow):
             config.read(config_path)
             return config.get("Version", "model_name", fallback="gemini-2.5-flash")
         return "gemini-2.5-flash"
-    
-    def _create_menu_bar(self):
-        menu_bar = self.menuBar()
-        file_menu = menu_bar.addMenu("Dosya")
-        new_project_action = file_menu.addAction("Yeni Proje")
-        new_project_action.triggered.connect(self.new_project_clicked)
-        # "Kaydet" menü öğesini "Proje Ayarları" fonksiyonuna bağlayalım
-        save_action = file_menu.addAction("Ayarları Kaydet") # Aslında proje ayarlarını açacak
-        save_action.triggered.connect(self.open_project_settings_dialog) 
-        exit_action = file_menu.addAction("Çıkış")
-        exit_action.triggered.connect(self.close)
 
-        project_menu = menu_bar.addMenu("Proje")
-        delete_project_action = project_menu.addAction("Proje Sil")
-        delete_project_action.triggered.connect(self.delete_project_clicked)
-        
-        project_settings_action = project_menu.addAction("Proje Ayarları")
-        project_settings_action.triggered.connect(self.open_project_settings_dialog)
-        # --- YENİ AYARLAR MENÜSÜ ---
-        settings_menu = menu_bar.addMenu("Ayarlar")
-        prompt_editor_action = settings_menu.addAction("Promt Editörü")
-        prompt_editor_action.triggered.connect(self.open_prompt_editor)
-        
-        apikey_editor_action = settings_menu.addAction("API Key Editörü")
-        apikey_editor_action.triggered.connect(self.open_apikey_editor)
-        
-        gemini_version_action = settings_menu.addAction("Gemini Versiyon")
-        gemini_version_action.triggered.connect(self.open_gemini_version_dialog)
-        
-        mcp_action = settings_menu.addAction("Yapay Zeka Kaynağı (MCP)")
-        mcp_action.triggered.connect(self.open_mcp_dialog)
-
-        # --- YENİ JS SAVE MENÜSÜ ---
-        js_save_menu = menu_bar.addMenu("JS Kaydet")
-        
-        save_booktoki_action = js_save_menu.addAction("Booktoki")
-        save_booktoki_action.triggered.connect(lambda: self.save_js_file("booktoki.js"))
-        
-        save_69shuba_action = js_save_menu.addAction("69shuba")
-        save_69shuba_action.triggered.connect(lambda: self.save_js_file("69shuba.js"))
-
-        save_novelfire_action = js_save_menu.addAction("Novelfire")
-        save_novelfire_action.triggered.connect(lambda: self.save_js_file("novelfire.js"))
-
-        help_menu = menu_bar.addMenu("Yardım")
-        about_action = help_menu.addAction("Hakkında")
-        about_action.triggered.connect(self.show_about_dialog)
-
-    def save_js_file(self, js_filename):
-        """Kullanıcının seçtiği JS dosyasını istediği yere kaydetmesini sağlar."""
-        source_path = os.path.join(os.getcwd(), js_filename)
-        
-        if not os.path.exists(source_path):
-            try:
-                from js_create import create_js_file
-                create_js_file(js_filename)
-            except Exception:
-                pass
-                
-        if not os.path.exists(source_path):
-            QMessageBox.warning(self, "Dosya Bulunamadı", f"'{js_filename}' dosyası ana dizinde bulunamadı!")
-            return
-            
-        default_save_path = os.path.join(os.path.expanduser("~"), "Desktop", js_filename)
-        save_path, _ = QFileDialog.getSaveFileName(self, f"{js_filename} Dosyasını Kaydet", default_save_path, "JavaScript Files (*.js);;All Files (*)")
-        
-        if save_path:
-            try:
-                import shutil
-                shutil.copy2(source_path, save_path)
-                QMessageBox.information(self, "Başarılı", f"Dosya başarıyla kaydedildi:\n{save_path}")
-            except Exception as e:
-                QMessageBox.critical(self, "Kayıt Hatası", f"Dosya kaydedilirken bir hata oluştu:\n{str(e)}")
-
-    def open_prompt_editor(self):
-        PromptEditorDialog(self).exec()
-
-    def open_apikey_editor(self):
-        ApiKeyEditorDialog(self).exec()
-        
-    def open_gemini_version_dialog(self):
-        GeminiVersionDialog(self).exec()
-
-    def open_mcp_dialog(self):
-        MCPServerDialog(self).exec()
-
+    # ─────────────── Panel Oluşturma ───────────────
     def _create_left_panel(self):
         left_layout = QVBoxLayout()
         left_layout.addWidget(QLabel("Projeler:"))
-        
-        # Proje arama çubuğu
         search_layout = QHBoxLayout()
         self.project_search_input = QLineEdit()
         self.project_search_input.setPlaceholderText("🔍 Proje ara...")
-        self.project_search_input.textChanged.connect(self.filter_project_list)
+        self.project_search_input.textChanged.connect(self.file_table_interactions.filter_project_list)
         self.project_search_clear_btn = QPushButton("✕")
         self.project_search_clear_btn.setFixedWidth(30)
         self.project_search_clear_btn.clicked.connect(lambda: self.project_search_input.clear())
         search_layout.addWidget(self.project_search_input)
         search_layout.addWidget(self.project_search_clear_btn)
         left_layout.addLayout(search_layout)
-        
         self.project_list = QListWidget()
-        self.project_list.setFont(QFont("Arial", 10)) 
+        self.project_list.setFont(QFont("Arial", 10))
         self.project_list.currentItemChanged.connect(self.update_file_list_from_selection)
         self.project_list.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Expanding)
         self.project_list.setMaximumWidth(250)
@@ -383,203 +161,100 @@ class MainWindow(QMainWindow):
 
     def _create_center_panel(self):
         center_layout = QVBoxLayout()
-        
-        # Dosya arama çubuğu
         file_search_layout = QHBoxLayout()
         self.file_search_input = QLineEdit()
         self.file_search_input.setPlaceholderText("🔍 Dosya ara...")
-        self.file_search_input.textChanged.connect(self.filter_file_table)
+        self.file_search_input.textChanged.connect(self.file_table_interactions.filter_file_table)
         self.file_search_clear_btn = QPushButton("✕")
         self.file_search_clear_btn.setFixedWidth(30)
         self.file_search_clear_btn.clicked.connect(lambda: self.file_search_input.clear())
         file_search_layout.addWidget(self.file_search_input)
         file_search_layout.addWidget(self.file_search_clear_btn)
         center_layout.addLayout(file_search_layout)
-        
         self.file_table = QTableWidget()
-        self.file_table.setColumnCount(8) 
-        headers = ["Seç", "Orijinal Dosya", "Çevrilen Dosya", "Oluşturma Tarihi", "Boyut", "Durum", "Orijinal Token", "Çevrilen Token"] 
+        self.file_table.setColumnCount(8)
+        headers = ["Seç", "Orijinal Dosya", "Çevrilen Dosya", "Oluşturma Tarihi", "Boyut", "Durum", "Orijinal Token", "Çevrilen Token"]
         self.file_table.setHorizontalHeaderLabels(headers)
-        self.file_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.file_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.file_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.file_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self.file_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        self.file_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
-        self.file_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
-        self.file_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
-        self.file_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows) 
-        self.file_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers) 
+        for i, mode in enumerate([
+            QHeaderView.ResizeMode.ResizeToContents,
+            QHeaderView.ResizeMode.Stretch,
+            QHeaderView.ResizeMode.Stretch,
+            QHeaderView.ResizeMode.ResizeToContents,
+            QHeaderView.ResizeMode.ResizeToContents,
+            QHeaderView.ResizeMode.Stretch,
+            QHeaderView.ResizeMode.ResizeToContents,
+            QHeaderView.ResizeMode.ResizeToContents,
+        ]):
+            self.file_table.horizontalHeader().setSectionResizeMode(i, mode)
+        self.file_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.file_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         center_layout.addWidget(self.file_table)
         self.main_layout.addLayout(center_layout, 4)
 
-        # Sağ tıklama menüsü için ayarlar
-        self.file_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.file_table.customContextMenuRequested.connect(self.file_table_context_menu)
-        
-        # Çift tıklama ile düzenleme
-        self.file_table.cellDoubleClicked.connect(self.on_file_table_double_click)
+    # ─────────────── Delegasyon Metotları ───────────────
+    # Controller'lara yönlendirme (butonlar bu metotlara bağlı)
+    def start_download_process(self):
+        self.download_ctrl.start()
 
+    def start_split_process(self):
+        self.split_ctrl.start()
 
-    def _create_right_panel(self):
-        right_layout = QVBoxLayout()
-        
-        # Yeni İndirme Yöntemi Combo Box (İndirme öncesi ayarları)
-        self.downloadMethodCombo = QComboBox()
-        self.downloadMethodCombo.addItems([
-            "Booktoki JS İle İndir (Selenium)",
-            "69shuba JS İle İndir (Selenium)",
-            "Novelfire JS İle İndir (Selenium)",
-            "Normal Web Kazıma (Requests) (Tavsiye Edilmez)"
-        ])
-        self.downloadMethodCombo.setStyleSheet("QComboBox QAbstractItemView { background-color: #2D2D30; color: white; selection-background-color: #3F51B5; } padding: 5px; font-size: 10pt;")
-        right_layout.addWidget(QLabel("İndirme Yöntemi:"))
-        right_layout.addWidget(self.downloadMethodCombo)
+    def start_translation_process(self):
+        self.translation_ctrl.start()
 
-        self.startButton = QPushButton("İndirmeyi Başlat")
-        self.startButton.setFont(QFont("Arial", 11, QFont.Weight.Bold))
-        self.startButton.setStyleSheet("background-color: #4CAF50; color: white; border-radius: 5px; padding: 10px;")
-        self.startButton.clicked.connect(self.start_download_process)
-        right_layout.addWidget(self.startButton)
+    def stop_translation_process(self):
+        self.translation_ctrl.stop_translation()
 
-        self.splitButton = QPushButton("Toplu Bölüm Ekle")
-        self.splitButton.setFont(QFont("Arial", 11, QFont.Weight.Bold))
-        self.splitButton.setStyleSheet("background-color: #3F51B5; color: white; border-radius: 5px; padding: 10px;")
-        self.splitButton.clicked.connect(self.start_split_process)
-        right_layout.addWidget(self.splitButton)
+    def start_merging_process(self):
+        self.merge_ctrl.start()
 
-        self.translateButton = QPushButton("Seçilenleri Çevir") 
-        self.translateButton.setFont(QFont("Arial", 11, QFont.Weight.Bold))
-        self.translateButton.setStyleSheet("background-color: #2196F3; color: white; border-radius: 5px; padding: 10px;") 
-        self.translateButton.clicked.connect(self.start_translation_process)
-        self.translateButton.setEnabled(False) 
-        right_layout.addWidget(self.translateButton)
-        #   --- YENİ EKLENEN KISIM: SAYILI ÇEVİR ---
-        limit_layout = QHBoxLayout()
-        self.limit_checkbox = QCheckBox("Sayılı çevir")
-        self.limit_checkbox.setFont(QFont("Arial", 9))
-        self.limit_checkbox.setToolTip("İşaretlenirse sadece yandaki sayı kadar dosya çevrilip durur.")
-        
-        self.limit_spinbox = QSpinBox()
-        self.limit_spinbox.setMinimum(1)
-        self.limit_spinbox.setMaximum(99999)
-        self.limit_spinbox.setValue(20) # Varsayılan değer
-        self.limit_spinbox.setEnabled(True) # Başlangıçta pasif
-        
-        # Checkbox işaretlenince spinbox aktif olsun
-        self.limit_checkbox.toggled.connect(self.limit_spinbox.setEnabled)
-        
-        limit_layout.addWidget(self.limit_checkbox)
-        limit_layout.addWidget(self.limit_spinbox)
-        right_layout.addLayout(limit_layout)
-        # --- YENİ CHECKBOX ---
-        self.shutdown_checkbox = QCheckBox("Çeviri Bitince Bilgisayarı Kapat")
-        self.shutdown_checkbox.setFont(QFont("Arial", 9))
-        self.shutdown_checkbox.setStyleSheet("margin-left: 5px; margin-bottom: 5px;")
-        self.shutdown_checkbox.toggled.connect(self.on_shutdown_checkbox_toggled) 
-        right_layout.addWidget(self.shutdown_checkbox)
-        # --- BİTİŞ ---
+    def start_cleaning_process(self):
+        self.cleaning_ctrl.start()
 
-        
-        self.mergeButton = QPushButton("Seçili Çevirileri Birleştir") 
-        self.mergeButton.setFont(QFont("Arial", 11, QFont.Weight.Bold))
-        self.mergeButton.setStyleSheet("background-color: #9C27B0; color: white; border-radius: 5px; padding: 10px;") 
-        self.mergeButton.clicked.connect(self.start_merging_process)
-        self.mergeButton.setEnabled(False) 
-        right_layout.addWidget(self.mergeButton)
+    def start_epub_process(self):
+        self.epub_ctrl.start()
 
-        # --- Çeviriyi Durdurma Butonu ---
-        self.stopTranslationButton = QPushButton("■ Çeviriyi Durdur")
-        self.stopTranslationButton.setFont(QFont("Arial", 9, QFont.Weight.Bold))
-        self.stopTranslationButton.setStyleSheet("background-color: #F44336; color: white; border-radius: 5px; padding: 6px;")
-        self.stopTranslationButton.clicked.connect(self.stop_translation_process)
-        self.stopTranslationButton.setVisible(False)  # Başlangıçta gizli
-        right_layout.addWidget(self.stopTranslationButton)
+    def start_error_check_process(self):
+        self.error_check_ctrl.start()
 
-        # --- Çeviri Hata Kontrol Butonu (Önceki "Başlık Kontrolü" yerine) ---
-        self.errorCheckButton = QPushButton("Çeviri Hata Kontrol")
-        self.errorCheckButton.setFont(QFont("Arial", 11, QFont.Weight.Bold))
-        self.errorCheckButton.setStyleSheet("background-color: #009688; color: white; border-radius: 5px; padding: 10px;")
-        self.errorCheckButton.clicked.connect(self.start_error_check_process)
-        self.errorCheckButton.setEnabled(False)
-        right_layout.addWidget(self.errorCheckButton)
-        # Başlık Kontrolü butonu da korunuyor (arka planda)
-        # --- YENİ BUTON: EPUB ÇEVİR ---
-        self.epubButton = QPushButton("Seçilenleri EPUB Yap")
-        self.epubButton.setFont(QFont("Arial", 11, QFont.Weight.Bold))
-        self.epubButton.setStyleSheet("background-color: #795548; color: white; border-radius: 5px; padding: 10px;") # Kahverengi tonu
-        self.epubButton.clicked.connect(self.start_epub_process)
-        self.epubButton.setEnabled(False)
-        right_layout.addWidget(self.epubButton)
-        # Yeni Token Say butonu eklendi
-        self.token_count_button = QPushButton("Token Say")
-        self.token_count_button.setFont(QFont("Arial", 11, QFont.Weight.Bold))
-        self.token_count_button.setStyleSheet("background-color: #673AB7; color: white; border-radius: 5px; padding: 10px;") # Mor ton
-        self.token_count_button.clicked.connect(self.start_token_counting_manually)
-        self.token_count_button.setEnabled(False) # Başlangıçta pasif
-        right_layout.addWidget(self.token_count_button)
+    def start_chapter_check_process(self):
+        self.chapter_check_ctrl.start()
 
-        self.progressBar = QProgressBar(self)
-        self.progressBar.setTextVisible(True)
-        self.progressBar.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.progressBar.setVisible(False) 
-        right_layout.addWidget(self.progressBar)
-        
-        self.statusLabel = QLabel("Durum: Hazır")
-        self.statusLabel.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.statusLabel.setFont(QFont("Arial", 10))
-        self.statusLabel.setWordWrap(True)
-        right_layout.addWidget(self.statusLabel)
+    def start_ml_terminology_process(self):
+        self.ml_terminology_ctrl.start()
 
-        # Yeni token bilgileri ve ilerleme çubuğu
-        self.total_tokens_label = QLabel("Toplam Token: 0")
-        self.total_original_tokens_label = QLabel("Orijinal Token: 0")
-        self.total_translated_tokens_label = QLabel("Çevrilen Token: 0")
-        self.token_progress_bar = QProgressBar(self)
-        self.token_progress_bar.setTextVisible(True)
-        self.token_progress_bar.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.token_progress_bar.setVisible(False) # Başlangıçta gizli
+    def start_token_counting_manually(self):
+        self.token_ctrl.start()
 
-        token_info_layout = QVBoxLayout()
-        token_info_layout.addWidget(self.total_tokens_label)
-        token_info_layout.addWidget(self.total_original_tokens_label)
-        token_info_layout.addWidget(self.total_translated_tokens_label)
-        token_info_layout.addWidget(self.token_progress_bar)
-        right_layout.addLayout(token_info_layout) # Ana düzeneğe ekle
+    def mark_highlighted_rows_checked(self):
+        self.file_table_interactions.mark_highlighted_rows_checked()
 
-        self.selectHighlightedButton = QPushButton("Seç (Vurgulananları İşaretle)")
-        self.selectHighlightedButton.setFont(QFont("Arial", 10))
-        self.selectHighlightedButton.setStyleSheet("background-color: #607D8B; color: white; border-radius: 5px; padding: 7px;")
-        self.selectHighlightedButton.clicked.connect(self.mark_highlighted_rows_checked)
-        right_layout.addWidget(self.selectHighlightedButton)
+    def show_api_stats_dialog(self):
+        show_api_stats_dialog(self)
 
+    # ─────────────── Dialog Açma ───────────────
+    def open_prompt_editor(self):
+        PromptEditorDialog(self).exec()
 
-        self.projectSettingsButton = QPushButton("Proje Ayarları") 
-        self.projectSettingsButton.setFont(QFont("Arial", 10))
-        self.projectSettingsButton.setStyleSheet("background-color: #008CBA; color: white; border-radius: 5px; padding: 7px;")
-        self.projectSettingsButton.clicked.connect(self.open_project_settings_dialog) 
-        right_layout.addWidget(self.projectSettingsButton)
+    def open_apikey_editor(self):
+        ApiKeyEditorDialog(self).exec()
 
-        self.helpButton = QPushButton("Yardım")
-        self.helpButton.setFont(QFont("Arial", 10))
-        self.helpButton.setStyleSheet("background-color: #008CBA; color: white; border-radius: 5px; padding: 7px;")
-        self.helpButton.clicked.connect(self.show_help_clicked)
-        right_layout.addWidget(self.helpButton)
-            
-        right_layout.addStretch() 
-        self.main_layout.addLayout(right_layout, 1)
+    def open_gemini_version_dialog(self):
+        GeminiVersionDialog(self).exec()
 
-    def on_shutdown_checkbox_toggled(self, checked):
-        if checked:
-            reply = QMessageBox.warning(self, "Otomatik Kapatma",
-                                        "İşlem bitince bilgisayar ONAYSIZ kapatılacak.\nDevam?",
-                                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                                        QMessageBox.StandardButton.No)
-            if reply == QMessageBox.StandardButton.No:
-                self.shutdown_checkbox.blockSignals(True)
-                self.shutdown_checkbox.setChecked(False)
-                self.shutdown_checkbox.blockSignals(False)
+    def open_mcp_dialog(self):
+        MCPServerDialog(self).exec()
 
+    def open_app_settings_dialog(self):
+        dialog = AppSettingsDialog(self)
+        dialog.settings_changed.connect(self._on_app_settings_changed)
+        dialog.exec()
+
+    def _on_app_settings_changed(self, settings: dict):
+        apply_theme(QApplication.instance(), settings.get("theme", "dark"))
+        app_logger.info("Uygulama ayarları güncellendi.")
+
+    # ─────────────── Proje Yönetimi ───────────────
     def load_existing_projects(self):
         self.project_list.clear()
         current_dir = os.getcwd()
@@ -590,7 +265,7 @@ class MainWindow(QMainWindow):
                 if os.path.exists(config_file_path):
                     self.project_list.addItem(item)
         if self.project_list.count() > 0:
-            self.project_list.setCurrentRow(0) 
+            self.project_list.setCurrentRow(0)
 
     def new_project_clicked(self):
         dialog = NewProjectDialog(self)
@@ -599,36 +274,28 @@ class MainWindow(QMainWindow):
             if not project_name or not project_link:
                 QMessageBox.warning(self, "Eksik Bilgi", "Proje adı ve linki boş bırakılamaz.")
                 return
-            # API Key veya MCP kontrolü
             if not api_key and not mcp_endpoint_id:
                 QMessageBox.warning(self, "Yapılandırma Eksik", "Çeviri ve token sayımı için Gemini API anahtarı veya MCP bağlantısı gereklidir.")
-            
             try:
                 base_path = os.path.join(os.getcwd(), project_name)
                 if os.path.exists(base_path):
                     QMessageBox.warning(self, "Hata", f"'{project_name}' adında bir proje zaten mevcut.")
                     return
-                subfolders = ["dwnld", "trslt", "cmplt", "config"] 
-                for folder in subfolders:
+                for folder in ["dwnld", "trslt", "cmplt", "config"]:
                     os.makedirs(os.path.join(base_path, folder))
-                
-                # Proje konfigürasyonunu kaydet
                 self.config['ProjectInfo'] = {'link': project_link}
                 if max_pages is not None:
                     self.config['ProjectInfo']['max_pages'] = str(max_pages)
                 self.config['ProjectInfo']['max_retries'] = str(max_retries)
-                self.config['API'] = {'gemini_api_key': api_key, 'api_key_name': api_key_name} 
+                self.config['API'] = {'gemini_api_key': api_key, 'api_key_name': api_key_name}
                 self.config["Startpromt"] = {'startpromt': startpromt}
-                
                 if mcp_endpoint_id:
                     self.config['MCP'] = {'endpoint_id': mcp_endpoint_id}
                 elif 'MCP' in self.config:
                     del self.config['MCP']
-
-                config_path = os.path.join(base_path, 'config', 'config.ini') 
+                config_path = os.path.join(base_path, 'config', 'config.ini')
                 with open(config_path, 'w', encoding='utf-8') as configfile:
                     self.config.write(configfile)
-                
                 self.project_list.addItem(project_name)
                 QMessageBox.information(self, "Başarılı", f"'{project_name}' projesi başarıyla oluşturuldu.")
                 self.project_list.setCurrentItem(self.project_list.findItems(project_name, Qt.MatchFlag.MatchExactly)[0])
@@ -638,1391 +305,48 @@ class MainWindow(QMainWindow):
                 QMessageBox.critical(self, "Genel Hata", f"Proje oluşturulurken beklenmeyen bir hata oluştu:\n{e}")
 
     def delete_project_clicked(self):
+        import shutil
         current_item = self.project_list.currentItem()
         if not current_item:
             QMessageBox.warning(self, "Proje Seçilmedi", "Lütfen silmek istediğiniz projeyi seçin.")
             return
-
         project_name = current_item.text()
-        reply = QMessageBox.question(self, 'Proje Sil', 
+        reply = QMessageBox.question(self, 'Proje Sil',
                                      f"'{project_name}' projesini ve tüm içeriğini silmek istediğinize emin misiniz? Bu işlem geri alınamaz.",
-                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, 
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                      QMessageBox.StandardButton.No)
-        
         if reply == QMessageBox.StandardButton.Yes:
             project_path = os.path.join(os.getcwd(), project_name)
             try:
                 shutil.rmtree(project_path)
                 self.project_list.takeItem(self.project_list.row(current_item))
                 QMessageBox.information(self, "Başarılı", f"'{project_name}' projesi başarıyla silindi.")
-                self.update_file_list_from_selection() 
-            except OSError as e:
+                self.update_file_list_from_selection()
+            except Exception as e:
                 QMessageBox.critical(self, "Silme Hatası", f"Proje silinirken bir hata oluştu:\n{e}")
-            except Exception as e:
-                QMessageBox.critical(self, "Genel Hata", f"Proje silinirken beklenmeyen bir hata oluştu:\n{e}")
-
-
-    def start_download_process(self):
-        current_item = self.project_list.currentItem()
-        if not current_item:
-            QMessageBox.warning(self, "Proje Seçilmedi", "Lütfen sol listeden bir proje seçin.")
-            return
-        
-        project_name = current_item.text()
-        project_path = os.path.join(os.getcwd(), project_name)
-        config_path = os.path.join(project_path, 'config', 'config.ini') 
-
-        if not os.path.exists(config_path):
-            QMessageBox.critical(self, "Hata", f"'{project_name}' projesi için config.ini bulunamadı. Lütfen projeyi yeniden oluşturun veya linki manuel girin.")
-            return
-
-        try:
-            self.config.read(config_path)
-            project_link = self.config.get('ProjectInfo', 'link', fallback=None)
-            max_pages = self.config.getint('ProjectInfo', 'max_pages', fallback=None) 
-            
-            if not project_link:
-                QMessageBox.critical(self, "Hata", "Config dosyasında proje linki bulunamadı!")
-                return
-        except configparser.Error as e:
-            QMessageBox.critical(self, "Config Hatası", f"Config dosyası okunurken hata oluştu:\n{e}")
-            return
-        except Exception as e:
-            QMessageBox.critical(self, "Genel Hata", f"Proje bilgileri okunurken beklenmeyen bir hata oluştu:\n{e}")
-            return
-
-        download_folder = os.path.join(project_path, 'dwnld')
-        os.makedirs(download_folder, exist_ok=True) 
-
-        # Önceki indirme tamamlanmamışsa durdur
-        if self.download_thread and self.download_thread.isRunning():
-            self.download_worker.stop()
-            self.download_thread.quit()
-            self.download_thread.wait() 
-            self.download_thread = None
-            self.download_worker = None
-
-        # JS Script Yolu Belirleme
-        selected_method = self.downloadMethodCombo.currentText()
-        js_script_path = None
-        if "Booktoki" in selected_method:
-            js_script_path = os.path.join(os.getcwd(), "booktoki.js")
-            if not os.path.exists(js_script_path):
-                try:
-                    from js_create import create_js_file
-                    create_js_file("booktoki.js")
-                except Exception:
-                    pass
-            if not os.path.exists(js_script_path):
-                QMessageBox.warning(self, "Dosya Bulunamadı", "booktoki.js dosyası mevcut dizinde bulunamadı!")
-                return
-        elif "69shuba" in selected_method:
-            js_script_path = os.path.join(os.getcwd(), "69shuba.js")
-            if not os.path.exists(js_script_path):
-                try:
-                    from js_create import create_js_file
-                    create_js_file("69shuba.js")
-                except Exception:
-                    pass
-            if not os.path.exists(js_script_path):
-                QMessageBox.warning(self, "Dosya Bulunamadı", "69shuba.js dosyası mevcut dizinde bulunamadı!")
-                return
-        elif "Novelfire" in selected_method:
-            js_script_path = os.path.join(os.getcwd(), "novelfire.js")
-            if not os.path.exists(js_script_path):
-                try:
-                    from js_create import create_js_file
-                    create_js_file("novelfire.js")
-                except Exception:
-                    pass
-            if not os.path.exists(js_script_path):
-                QMessageBox.warning(self, "Dosya Bulunamadı", "novelfire.js dosyası mevcut dizinde bulunamadı!")
-                return
-
-        self.download_thread = QThread()
-        self.download_worker = DownloadWorker(project_link, download_folder, max_pages, js_script_path) 
-        self.download_worker.moveToThread(self.download_thread)
-        
-        self.download_thread.started.connect(self.download_worker.run)
-        self.download_worker.finished.connect(self.download_thread.quit)
-        self.download_worker.finished.connect(self.download_worker.deleteLater)
-        self.download_thread.finished.connect(self.download_thread.deleteLater)
-        
-        self.download_worker.file_downloaded.connect(self.add_file_to_table)
-        self.download_worker.error.connect(self.on_download_error)
-        self.download_worker.finished.connect(self.on_download_finished)
-        self.download_worker.progress.connect(self.update_download_progress) 
-        self.download_worker.selenium_menu_required.connect(self.handle_selenium_menu)
-        
-        self.download_thread.start()
-        
-        # JS kullanılıyorsa max_pages önceden bilinmediği için progress max değerini gizleyelim (100 ile sabitliyoruz logikte)
-        if js_script_path:
-            self._set_ui_state_on_process_start(self.startButton, "İndiriliyor (Tarayıcı)...", "#FFC107", "black", 100, "Durum: Tarayıcı ile indiriliyor...")
-        else:
-            self._set_ui_state_on_process_start(self.startButton, "İndiriliyor...", "#FFC107", "black", max_pages if max_pages else 0, "Durum: İndirme işlemi başlatıldı...")
-        
-        self.file_table.setRowCount(0)
-
-    def update_download_progress(self, current, total):
-        self.progressBar.setValue(current)
-        if total > 0:
-            self.progressBar.setMaximum(total)
-            self.statusLabel.setText(f"Durum: İndiriliyor... Sayfa {current}/{total}")
-        else:
-            self.statusLabel.setText(f"Durum: İndiriliyor... Sayfa {current}")
-
-    def handle_selenium_menu(self):
-        """Selenium worker'dan gelen menü isteğini işler."""
-        if not self.download_worker:
-            return
-            
-        dialog = SeleniumMenuDialog(self.download_worker, self)
-        dialog.exec()
-        # Not: Artık seçimleri diyalog kendi içinden worker'a set ediyor.
-
-    def on_download_finished(self):
-        # Selenium indirmelerinde diyalog kendi uyarısını gösterdiği için 
-        # burada mükerrer uyarı vermeyelim.
-        if hasattr(self, 'selenium_dialog') and self.selenium_dialog and self.selenium_dialog.isVisible():
-            app_logger.info("MainWindow: İndirme bitti (Diyalog aktif olduğu için ana uyarı atlandı).")
-            return
-            
-        app_logger.info("MainWindow: İndirme işlemi başarıyla tamamlandı.")
-        QMessageBox.information(self, "Tamamlandı", "İndirme işlemi bitti.")
-        self._set_ui_state_on_process_end(self.startButton, "İndirmeyi Başlat", "#4CAF50", "white", "Durum: Hazır")
-        self.download_thread = None
-        self.download_worker = None
-        self.update_file_list_from_selection() 
-
-    def on_download_error(self, message):
-        QMessageBox.critical(self, "İndirme Hatası", f"Bir hata oluştu:\n{message}")
-        self._set_ui_state_on_process_end(self.startButton, "İndirmeyi Başlat", "#FF5722", "white", f"Durum: Hata - {message}")
-        self.download_thread = None
-        self.download_worker = None
-
-    def start_split_process(self):
-        from PyQt6.QtWidgets import QFileDialog
-
-        current_item = self.project_list.currentItem()
-        if not current_item:
-            QMessageBox.warning(self, "Proje Seçilmedi", "Lütfen sol listeden bir proje seçin.")
-            return
-
-        project_name = current_item.text()
-        project_path = os.path.join(os.getcwd(), project_name)
-
-        input_file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Bölünecek TXT Dosyasını Seçin",
-            "",
-            "Text Dosyaları (*.txt);;Tüm Dosyalar (*)"
-        )
-
-        if not input_file_path:
-            return  # Kullanıcı seçimi iptal etti
-
-        output_folder = os.path.join(project_path, 'dwnld')
-        os.makedirs(output_folder, exist_ok=True)
-
-        if self.split_thread and self.split_thread.isRunning():
-            self.split_worker.stop()
-            self.split_thread.quit()
-            self.split_thread.wait()
-            self.split_thread = None
-            self.split_worker = None
-
-        self.split_thread = QThread()
-        self.split_worker = SplitWorker(input_file_path, output_folder)
-        self.split_worker.moveToThread(self.split_thread)
-
-        self.split_thread.started.connect(self.split_worker.run)
-        self.split_worker.finished.connect(self.split_thread.quit)
-        self.split_worker.finished.connect(self.split_worker.deleteLater)
-        self.split_thread.finished.connect(self.split_thread.deleteLater)
-
-        self.split_worker.finished.connect(self.on_split_finished)
-        self.split_worker.error.connect(self.on_split_error)
-        self.split_worker.progress.connect(self.update_split_progress)
-
-        self.split_thread.start()
-        self._set_ui_state_on_process_start(self.splitButton, "Bölünüyor...", "#FFC107", "black", 100, "Durum: Dosya parçalanıyor...")
-
-    def update_split_progress(self, current, total):
-        self.progressBar.setValue(current)
-        if total > 0:
-            self.progressBar.setMaximum(total)
-            self.statusLabel.setText(f"Durum: Parçalanıyor... {current}/{total} bölüm oluşturuldu")
-
-    def on_split_finished(self):
-        QMessageBox.information(self, "Tamamlandı", "Dosya başarıyla parçalandı ve projeye eklendi.")
-        self._set_ui_state_on_process_end(self.splitButton, "Toplu Bölüm Ekle", "#3F51B5", "white", "Durum: Hazır")
-        self.split_thread = None
-        self.split_worker = None
-        self.update_file_list_from_selection()
-
-    def on_split_error(self, message):
-        QMessageBox.critical(self, "Parçalama Hatası", f"Bir hata oluştu:\n{message}")
-        self._set_ui_state_on_process_end(self.splitButton, "Toplu Bölüm Ekle", "#FF5722", "white", f"Durum: Hata - {message}")
-        self.split_thread = None
-        self.split_worker = None
-
-    def start_translation_process(self):
-        # Eğer zaten çalışıyorsa duraklatma/devam etme mantığını işlet
-        if self.translation_thread and self.translation_thread.isRunning():
-            if self.translation_worker.is_paused:
-                self.translation_worker.resume()
-                self.translateButton.setText("Duraklat")
-                self.translateButton.setStyleSheet("background-color: #FFC107; color: black; border-radius: 5px; padding: 10px;")
-                self.statusLabel.setText("Durum: Çeviriye devam ediliyor...")
-            else:
-                self.translation_worker.pause()
-                self.translateButton.setText("Devam Et")
-                self.translateButton.setStyleSheet("background-color: #4CAF50; color: white; border-radius: 5px; padding: 10px;") # Yeşil
-                self.statusLabel.setText("Durum: Çeviri duraklatıldı.")
-            return
-        # Yeni Başlatma
-        current_item = self.project_list.currentItem()
-        if not current_item:
-            QMessageBox.warning(self, "Proje Seçilmedi", "Lütfen sol listeden bir proje seçin.")
-            return
-
-        project_name = current_item.text()
-        project_path = os.path.join(os.getcwd(), project_name)
-        config_path = os.path.join(project_path, 'config', 'config.ini')
-
-        if not os.path.exists(config_path):
-            QMessageBox.critical(self, "Hata", f"'{project_name}' projesi için config.ini bulunamadı. API anahtarı okunamıyor.")
-            return
-
-        try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                self.config.read_file(f)
-            api_key = self.config.get('API', 'gemini_api_key', fallback=None)
-            api_key_name = self.config.get('API', 'api_key_name', fallback='Varsayılan')
-            startpromt = self.config.get('Startpromt', 'startpromt', fallback=None)
-            mcp_endpoint_id = self.config.get('MCP', 'endpoint_id', fallback=None)
-            
-            if not api_key and not mcp_endpoint_id:
-                QMessageBox.critical(self, "Yapılandırma Eksik", "Seçili proje için API anahtarı veya MCP bağlantısı bulunamadı. Lütfen proje ayarlarından yapılandırın.")
-                return
-        except configparser.Error as e:
-            QMessageBox.critical(self, "Config Hatası", f"Config dosyası okunurken hata oluştu:\n{e}")
-            return
-        except Exception as e:
-            QMessageBox.critical(self, "Genel Hata", f"API anahtarı okunurken beklenmeyen bir hata oluştu:\n{e}")
-            return
-
-        input_folder = os.path.join(project_path, 'dwnld')
-        output_folder = os.path.join(project_path, 'trslt')
-        
-        # Ensure output folder exists before starting translation worker
-        os.makedirs(output_folder, exist_ok=True)
-
-        files_to_translate = [f for f in os.listdir(input_folder) if f.endswith('.txt')]
-        if not files_to_translate:
-            QMessageBox.information(self, "Dosya Yok", "İndirilenler klasöründe çevrilecek dosya bulunamadı.")
-            return
-        
-        # Önceki çeviri tamamlanmamışsa durdur
-        model_version = self.get_gemini_model_version()
-        if self.translation_thread and self.translation_thread.isRunning():
-            self.translation_worker.stop()
-            self.translation_thread.quit()
-            self.translation_thread.wait() # Thread'in bitmesini bekle
-            self.translation_thread = None
-            self.translation_worker = None
-        file_limit = None
-        if self.limit_checkbox.isChecked():
-            file_limit = self.limit_spinbox.value()
-            
-        max_retries = self.config.getint('ProjectInfo', 'max_retries', fallback=3)
-        cache_enabled = self.config.getboolean('Features', 'cache_enabled', fallback=True)
-        terminology_enabled = self.config.getboolean('Features', 'terminology_enabled', fallback=True)
-        self.translation_thread = QThread()
-        self.translation_worker = TranslationWorker(input_folder, output_folder, api_key, startpromt, model_version, file_limit=file_limit, max_retries=max_retries, project_path=project_path, cache_enabled=cache_enabled, terminology_enabled=terminology_enabled, endpoint_id=mcp_endpoint_id)
-        
-        self.translation_worker.shutdown_on_finish = self.shutdown_checkbox.isChecked()
-        self.translation_worker.moveToThread(self.translation_thread)
-
-        self.translation_thread.started.connect(self.translation_worker.run)
-        self.translation_worker.finished.connect(self.translation_thread.quit)
-        self.translation_worker.finished.connect(self.translation_worker.deleteLater)
-        self.translation_thread.finished.connect(self.translation_thread.deleteLater)
-
-        self.translation_worker.finished.connect(self.on_translation_finished) 
-        self.translation_worker.error.connect(self.on_translation_error)
-        self.translation_worker.progress.connect(self.update_translation_progress)
-        self.translation_worker.request_made.connect(self._on_translation_request_made)
-
-        self.translation_thread.start()
-        
-        # Buton durumlarını ayarla
-        self.startButton.setEnabled(False)
-        self.mergeButton.setEnabled(False) 
-        self.errorCheckButton.setEnabled(False)
-        self.projectSettingsButton.setEnabled(False) 
-        self.token_count_button.setEnabled(False) 
-        
-        # Çeviriyi Durdur butonu görünür olsun
-        self.stopTranslationButton.setVisible(True)
-        
-        # Translate butonu "Duraklat" işlevi kazanır
-        self.translateButton.setEnabled(True) 
-        self.translateButton.setText("Duraklat")
-        self.translateButton.setStyleSheet("background-color: #FFC107; color: black; border-radius: 5px; padding: 10px;") 
-        
-        self.progressBar.setValue(0)
-        self.progressBar.setMaximum(len(files_to_translate))
-        self.progressBar.setVisible(True)
-        
-        display_model = model_version
-        if mcp_endpoint_id:
-            try:
-                from llm_provider import load_endpoints
-                eps = load_endpoints().get("endpoints", [])
-                for ep in eps:
-                    if ep["id"] == mcp_endpoint_id:
-                        display_model = f"{ep['name']} ({ep['model_id']})"
-                        api_key_name = ep["type"]
-                        break
-            except: pass
-
-        self.statusLabel.setText(f"Durum: Çeviri başlatıldı... (Model: {display_model})")
-        
-        # Status bar güncelle
-        self._current_model = display_model
-        self._current_api_name = api_key_name
-        self._current_status = "Çeviri yapılıyor"
-        self.update_status_bar()
-
-
-    def update_translation_progress(self, current, total):
-        self.progressBar.setValue(current)
-        self.progressBar.setMaximum(total)
-        self.statusLabel.setText(f"Durum: Çevriliyor... Dosya {current}/{total}")
-
-    def _on_translation_request_made(self):
-        self.request_counter_manager.increment(self._current_model, self._current_api_name)
-        self.update_status_bar()
-
-    def on_translation_finished(self, shutdown_requested): # --- YENİ: Parametre eklendi ---
-        QMessageBox.information(self, "Tamamlandı", "Çeviri işlemi bitti.")
-        self.startButton.setEnabled(True)
-        self.translateButton.setEnabled(True)
-        self.mergeButton.setEnabled(True) # Çeviri bitince birleştirme aktif
-        self.epubButton.setEnabled(True)
-        self.projectSettingsButton.setEnabled(True) # İşlem bitince proje ayarları aktif
-        self.token_count_button.setEnabled(True) # İşlem bitince Token Say aktif
-        self.errorCheckButton.setEnabled(True) # İşlem bitince Hata Kontrol aktif
-        self.translateButton.setText("Seçilenleri Çevir")
-        self.translateButton.setStyleSheet("background-color: #2196F3; color: white; border-radius: 5px; padding: 10px;")
-        self.progressBar.setVisible(False)
-        self.statusLabel.setText("Durum: Hazır")
-        self.stopTranslationButton.setVisible(False)  # Durdur butonu gizle
-        self.translation_thread = None
-        self.translation_worker = None
-        self.update_file_list_from_selection()
-        
-        # Status bar güncelle
-        self._current_status = "Hazır"
-        self.update_status_bar()
-
-        # --- YENİ: Kapatma işlemini kontrol et ---
-        if shutdown_requested:
-            reply = QMessageBox.question(self, 'Bilgisayar Kapatılıyor', 
-                                         "Çeviri tamamlandı. Bilgisayar 60 saniye içinde kapatılacak.\nİptal etmek istiyor musunuz?",
-                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, 
-                                         QMessageBox.StandardButton.No)
-            if reply == QMessageBox.StandardButton.Yes:
-                self._cancel_shutdown_computer()
-            else:
-                self._shutdown_computer()
-        # --- BİTİŞ ---
-
-    def on_translation_error(self, message):
-        # This catches general errors from TranslationWorker.run(), not file-specific ones.
-        QMessageBox.critical(self, "Çeviri Hatası", f"Bir hata oluştu:\n{message}")
-        self.startButton.setEnabled(True)
-        self.translateButton.setEnabled(True)
-        self.mergeButton.setEnabled(True) # Hata olsa bile birleştirme aktif edilebilir
-        self.epubButton.setEnabled(True)
-        self.projectSettingsButton.setEnabled(True) # Hata olsa bile proje ayarları aktif
-        self.token_count_button.setEnabled(True) # Hata olsa bile Token Say aktif
-        self.errorCheckButton.setEnabled(True) # Hata olsa bile Hata Kontrol aktif
-        self.translateButton.setText("Seçilenleri Çevir")
-        self.translateButton.setStyleSheet("background-color: #FF5722; color: white; border-radius: 5px; padding: 10px;")
-        self.progressBar.setVisible(False)
-        self.statusLabel.setText(f"Durum: Hata - {message}")
-        self.translation_thread = None
-        self.translation_worker = None
-        self.update_file_list_from_selection() # Refresh to show any partial successes or errors
-
-    # --- YENİ METOTLAR: Bilgisayarı kapatma/iptal etme ---
-    def _shutdown_computer(self):
-        """İşletim sistemine göre bilgisayarı 60 saniye içinde kapatır."""
-        try:
-            if sys.platform == "win32": os.system("shutdown /s /t 60")
-            elif sys.platform == "darwin": os.system("sudo shutdown -h +1")
-            else: os.system("shutdown +1") 
-        except Exception as e: QMessageBox.critical(self, "Hata", str(e))
-
-    def start_cleaning_process(self):
-        current_item = self.project_list.currentItem()
-        if not current_item:
-            QMessageBox.warning(self, "Proje Seçilmedi", "Lütfen sol listeden bir proje seçin.")
-            return
-
-        project_name = current_item.text()
-        project_path = os.path.join(os.getcwd(), project_name)
-        
-        selected_file_paths = []
-        for row in range(self.file_table.rowCount()):
-            checkbox_item = self.file_table.item(row, 0)
-            if checkbox_item and checkbox_item.checkState() == Qt.CheckState.Checked:
-                original_file_name = self.file_table.item(row, 1).text()
-                translated_file_name = self.file_table.item(row, 2).text()
-                # Status column (column 5) now determines which file to clean
-                current_display_status = self.file_table.item(row, 5).text() 
-                
-                # Prioritize cleaning the translated file if it exists and is relevant
-                if translated_file_name and translated_file_name != "Yok":
-                    file_path = os.path.join(project_path, 'trslt', translated_file_name)
-                    if os.path.exists(file_path):
-                        selected_file_paths.append(file_path)
-                elif original_file_name and original_file_name != "Orijinali Yok":
-                    # If no translated file, or it's not selected/relevant, try original
-                    file_path = os.path.join(project_path, 'dwnld', original_file_name)
-                    if os.path.exists(file_path):
-                        selected_file_paths.append(file_path)
-
-
-        if not selected_file_paths:
-            QMessageBox.warning(self, "Dosya Seçilmedi", "Lütfen temizlemek için en az bir dosya seçin.")
-            return
-        
-        # Önceki temizleme tamamlanmamışsa durdur
-        if self.cleaning_thread and self.cleaning_thread.isRunning():
-            self.cleaning_worker.stop()
-            self.cleaning_thread.quit()
-            self.cleaning_thread.wait() # Thread'in bitmesini bekle
-            self.cleaning_thread = None
-            self.cleaning_worker = None
-
-        self.cleaning_thread = QThread()
-        # Pass the trslt folder as cleaning_folder for saving errors, since it's common
-        self.cleaning_worker = CleaningWorker(selected_file_paths, os.path.join(project_path, 'trslt'))
-        self.cleaning_worker.moveToThread(self.cleaning_thread)
-
-        self.cleaning_thread.started.connect(self.cleaning_worker.run)
-        self.cleaning_worker.finished.connect(self.cleaning_thread.quit)
-        self.cleaning_worker.finished.connect(self.cleaning_worker.deleteLater)
-        self.cleaning_thread.finished.connect(self.cleaning_thread.deleteLater)
-
-        self.cleaning_worker.finished.connect(self.on_cleaning_finished)
-        self.cleaning_worker.error.connect(self.on_cleaning_error)
-        self.cleaning_worker.progress.connect(self.update_cleaning_progress)
-
-        self.cleaning_thread.start()
-        self.startButton.setEnabled(False)
-        self.translateButton.setEnabled(False)
-        self.mergeButton.setEnabled(False) # Temizleme sırasında birleştirme devre dışı
-        self.projectSettingsButton.setEnabled(False) # İşlem sırasında proje ayarları devre dışı
-        self.token_count_button.setEnabled(False) # İşlem sırasında Token Say devre dışı
-        self.progressBar.setValue(0)
-        self.progressBar.setMaximum(len(selected_file_paths))
-        self.progressBar.setVisible(True)
-        self.statusLabel.setText(f"Durum: {len(selected_file_paths)} dosya temizleniyor...")
-
-
-    def update_cleaning_progress(self, current, total):
-        self.progressBar.setValue(current)
-        self.progressBar.setMaximum(total)
-        self.statusLabel.setText(f"Durum: Temizleniyor... Dosya {current}/{total}")
-
-    def on_cleaning_finished(self):
-        QMessageBox.information(self, "Tamamlandı", "Metin temizleme işlemi bitti.")
-        self.startButton.setEnabled(True)
-        self.translateButton.setEnabled(True)
-        self.mergeButton.setEnabled(True)
-        self.epubButton.setEnabled(True)
-        self.projectSettingsButton.setEnabled(True) # İşlem bitince proje ayarları aktif
-        self.token_count_button.setEnabled(True) # İşlem bitince Token Say aktif
-        self.errorCheckButton.setEnabled(True) # İşlem bitince Hata Kontrol aktif
-        self.progressBar.setVisible(False)
-        self.statusLabel.setText("Durum: Hazır")
-        self.cleaning_thread = None
-        self.cleaning_worker = None
-        self.update_file_list_from_selection() # Temizleme bitince listeyi güncelle (errors included)
-
-    def on_cleaning_error(self, message):
-        QMessageBox.critical(self, "Temizleme Hatası", f"Bir hata oluştu:\n{message}")
-        self.startButton.setEnabled(True)
-        self.translateButton.setEnabled(True)
-        self.mergeButton.setEnabled(True) # Hata olsa bile birleştirme aktif edilebilir
-        self.epubButton.setEnabled(True)
-        self.projectSettingsButton.setEnabled(True) # Hata olsa bile proje ayarları aktif
-        self.token_count_button.setEnabled(True) # Hata olsa bile Token Say aktif
-        self.errorCheckButton.setEnabled(True) # Hata olsa bile Hata Kontrol aktif
-        self.progressBar.setVisible(False)
-        self.statusLabel.setText(f"Durum: Hata - {message}")
-        self.cleaning_thread = None
-        self.cleaning_worker = None
-        self.update_file_list_from_selection() # Refresh to show any partial successes or errors
-
-    def start_merging_process(self):
-        current_item = self.project_list.currentItem()
-        if not current_item:
-            QMessageBox.warning(self, "Proje Seçilmedi", "Lütfen sol listeden bir proje seçin.")
-            return
-
-        project_name = current_item.text()
-        project_path = os.path.join(os.getcwd(), project_name)
-        
-        selected_translated_file_paths = []
-        for row in range(self.file_table.rowCount()):
-            checkbox_item = self.file_table.item(row, 0)
-            if checkbox_item and checkbox_item.checkState() == Qt.CheckState.Checked:
-                translated_file_name = self.file_table.item(row, 2).text() # Sütun 2 çevrilen dosya adı
-                if translated_file_name and translated_file_name != "Yok": # Sadece çevrilmiş dosyaları al
-                    file_path = os.path.join(project_path, 'trslt', translated_file_name)
-                    if os.path.exists(file_path):
-                        selected_translated_file_paths.append(file_path)
-
-        if not selected_translated_file_paths:
-            QMessageBox.warning(self, "Dosya Seçilmedi", "Lütfen birleştirmek için çevrilmiş dosya seçin.")
-            return
-            
-        # Dosyaları doğal sıraya göre sırala
-        
-        selected_translated_file_paths.sort(key=lambda x: natural_sort_key(os.path.basename(x)))
-
-        # Önceki birleştirme tamamlanmamışsa durdur
-        if self.merging_thread and self.merging_thread.isRunning():
-            self.merging_worker.stop()
-            self.merging_thread.quit()
-            self.merging_thread.wait() # Thread'in bitmesini bekle
-            self.merging_thread = None
-            self.merging_worker = None
-
-        output_merged_folder = os.path.join(project_path, 'cmplt')
-        os.makedirs(output_merged_folder, exist_ok=True) # Ensure output folder exists
-        
-        self.merging_thread = QThread()
-        self.merging_worker = MergingWorker(selected_translated_file_paths, output_merged_folder)
-        self.merging_worker.moveToThread(self.merging_thread)
-        
-        self.merging_thread.started.connect(self.merging_worker.run)
-        self.merging_worker.finished.connect(self.merging_thread.quit)
-        self.merging_worker.finished.connect(self.merging_worker.deleteLater)
-        self.merging_thread.finished.connect(self.merging_thread.deleteLater)
-        
-        self.merging_worker.finished.connect(self.on_merging_finished)
-        self.merging_worker.error.connect(self.on_merging_error)
-        self.merging_worker.progress.connect(self.update_merging_progress)
-        
-        self.merging_thread.start()
-        self.startButton.setEnabled(False)
-        self.translateButton.setEnabled(False)
-        self.mergeButton.setEnabled(False)
-        self.projectSettingsButton.setEnabled(False) # İşlem sırasında proje ayarları devre dışı
-        self.token_count_button.setEnabled(False) # İşlem sırasında Token Say devre dışı
-        self.mergeButton.setText("Birleştiriliyor...")
-        self.mergeButton.setStyleSheet("background-color: #FFC107; color: black; border-radius: 5px; padding: 10px;") # Sarı renk
-        self.progressBar.setValue(0)
-        self.progressBar.setMaximum(len(selected_translated_file_paths))
-        self.progressBar.setVisible(True)
-        self.statusLabel.setText(f"Durum: {len(selected_translated_file_paths)} dosya birleştiriliyor...")
-
-    def update_merging_progress(self, current, total):
-        self.progressBar.setValue(current)
-        self.progressBar.setMaximum(total)
-        self.statusLabel.setText(f"Durum: Birleştiriliyor... Dosya {current}/{total}")
-
-    def on_merging_finished(self):
-        QMessageBox.information(self, "Tamamlandı", "Seçili çevirileri birleştirme işlemi bitti.")
-        self.startButton.setEnabled(True)
-        self.translateButton.setEnabled(True)
-        self.mergeButton.setEnabled(True)
-        self.epubButton.setEnabled(True)
-        self.projectSettingsButton.setEnabled(True) # İşlem bitince proje ayarları aktif
-        self.token_count_button.setEnabled(True) # İşlem bitince Token Say aktif
-        self.errorCheckButton.setEnabled(True) # İşlem bitince Hata Kontrol aktif
-        self.mergeButton.setText("Seçili Çevirileri Birleştir")
-        self.mergeButton.setStyleSheet("background-color: #9C27B0; color: white; border-radius: 5px; padding: 10px;")
-        self.progressBar.setVisible(False)
-        self.statusLabel.setText("Durum: Hazır")
-        self.merging_thread = None
-        self.merging_worker = None
-        self.update_file_list_from_selection() 
-
-    def on_merging_error(self, message):
-        QMessageBox.critical(self, "Birleştirme Hatası", f"Bir hata oluştu:\n{message}")
-        self.startButton.setEnabled(True)
-        self.translateButton.setEnabled(True)
-        self.mergeButton.setEnabled(True)
-        self.epubButton.setEnabled(True)
-        self.projectSettingsButton.setEnabled(True) # Hata olsa bile proje ayarları aktif
-        self.token_count_button.setEnabled(True) # Hata olsa bile Token Say aktif
-        self.errorCheckButton.setEnabled(True) # Hata olsa bile Hata Kontrol aktif
-        self.mergeButton.setText("Seçili Çevirileri Birleştir")
-        self.mergeButton.setStyleSheet("background-color: #FF5722; color: white; border-radius: 5px; padding: 10px;")
-        self.progressBar.setVisible(False)
-        self.statusLabel.setText(f"Durum: Hata - {message}")
-        self.merging_thread = None
-        self.merging_worker = None
-        self.update_file_list_from_selection() 
-
-    # --- YENİ: Başlık Kontrolü Metotları ---
-    def start_chapter_check_process(self):
-        current_item = self.project_list.currentItem()
-        if not current_item:
-            QMessageBox.warning(self, "Proje Seçilmedi", "Lütfen sol listeden bir proje seçin.")
-            return
-
-        project_name = current_item.text()
-        project_path = os.path.join(os.getcwd(), project_name)
-        
-        # Kontrol edilecek dosyaları topla (Çevrilen Dosyalar)
-        files_to_check = [] # List of (filename, full_path)
-        for row in range(self.file_table.rowCount()):
-            checkbox_item = self.file_table.item(row, 0)
-            if checkbox_item and checkbox_item.checkState() == Qt.CheckState.Checked:
-                translated_file_name = self.file_table.item(row, 2).text()
-                if translated_file_name and translated_file_name != "Yok" and translated_file_name != "N/A":
-                    file_path = os.path.join(project_path, 'trslt', translated_file_name)
-                    files_to_check.append((translated_file_name, file_path))
-        
-        if not files_to_check:
-             QMessageBox.warning(self, "Dosya Seçilmedi", "Lütfen başlık kontrolü için en az bir çevrilmiş dosya seçin.")
-             return
-
-        # Önceki işlem varsa durdur
-        if self.chapter_check_thread and self.chapter_check_thread.isRunning():
-            self.chapter_check_worker.stop()
-            self.chapter_check_thread.quit()
-            self.chapter_check_thread.wait()
-            self.chapter_check_thread = None
-            self.chapter_check_worker = None
-        
-        self.chapter_check_thread = QThread()
-        self.chapter_check_worker = ChapterCheckWorker(project_path, files_to_check)
-        self.chapter_check_worker.moveToThread(self.chapter_check_thread)
-
-        self.chapter_check_thread.started.connect(self.chapter_check_worker.run)
-        self.chapter_check_worker.finished.connect(self.chapter_check_thread.quit)
-        self.chapter_check_worker.finished.connect(self.chapter_check_worker.deleteLater)
-        self.chapter_check_thread.finished.connect(self.chapter_check_thread.deleteLater)
-
-        self.chapter_check_worker.finished.connect(self.on_chapter_check_finished)
-        self.chapter_check_worker.progress.connect(self.update_chapter_check_progress)
-        self.chapter_check_worker.error.connect(self.on_chapter_check_error)
-
-        self.chapter_check_thread.start()
-        
-        # UI Güncelleme
-
-    def start_epub_process(self):
-            current_item = self.project_list.currentItem()
-            if not current_item:
-                QMessageBox.warning(self, "Proje Seçilmedi", "Lütfen sol listeden bir proje seçin.")
-                return
-
-            project_name = current_item.text()
-            project_path = os.path.join(os.getcwd(), project_name)
-            
-            # Seçili ve çevrilmiş dosyaları topla
-            selected_files = []
-            for row in range(self.file_table.rowCount()):
-                checkbox_item = self.file_table.item(row, 0)
-                if checkbox_item and checkbox_item.checkState() == Qt.CheckState.Checked:
-                    translated_file_name = self.file_table.item(row, 2).text()
-                    # Sadece çevrilmiş dosyalar (Yok veya N/A olmayanlar)
-                    if translated_file_name and translated_file_name not in ["Yok", "N/A"]:
-                        file_path = os.path.join(project_path, 'trslt', translated_file_name)
-                        if os.path.exists(file_path):
-                            selected_files.append(file_path)
-            
-            if not selected_files:
-                QMessageBox.warning(self, "Dosya Seçilmedi", "Lütfen EPUB yapmak için en az bir çevrilmiş dosya seçin.")
-                return
-
-            # Dosyaları doğal sıraya göre sırala (Bölüm 1, Bölüm 2, Bölüm 10 sırası için)
-            selected_files.sort(key=lambda x: natural_sort_key(os.path.basename(x)))
-
-            # Önceki işlem varsa durdur
-            if self.epub_thread and self.epub_thread.isRunning():
-                self.epub_worker.stop()
-                self.epub_thread.quit()
-                self.epub_thread.wait()
-                self.epub_thread = None
-                self.epub_worker = None
-
-            # Çıktı klasörü (Completed klasörü içine kaydedelim)
-            output_folder = os.path.join(project_path, 'cmplt')
-            os.makedirs(output_folder, exist_ok=True)
-
-            self.epub_thread = QThread()
-            self.epub_worker = EpubWorker(selected_files, output_folder, project_name=project_name)
-            self.epub_worker.moveToThread(self.epub_thread)
-
-            self.epub_thread.started.connect(self.epub_worker.run)
-            self.epub_worker.finished.connect(self.epub_thread.quit)
-            self.epub_worker.finished.connect(self.epub_worker.deleteLater)
-            self.epub_thread.finished.connect(self.epub_thread.deleteLater)
-
-            self.epub_worker.finished.connect(self.on_epub_finished)
-            self.epub_worker.error.connect(self.on_epub_error)
-            self.epub_worker.progress.connect(self.update_epub_progress)
-
-            self.epub_thread.start()
-            
-            # UI Güncelleme (Yardımcı fonksiyonunuzu kullanıyoruz)
-            self._set_ui_state_on_process_start(
-                self.epubButton, "Epub Oluşturuluyor...", "#FFC107", "black", 
-                len(selected_files), "Durum: EPUB dosyası oluşturuluyor..."
-            )
-
-    def update_epub_progress(self, current, total):
-        self.progressBar.setValue(current)
-        self.progressBar.setMaximum(total)
-        self.statusLabel.setText(f"Durum: EPUB Bölümleri Ekleniyor... {current}/{total}")
-
-    def on_epub_finished(self, message):
-        if message: # Boş mesaj gelirse hata var demektir veya işlem iptaldir
-            QMessageBox.information(self, "Tamamlandı", message)
-        
-        self._set_ui_state_on_process_end(
-            self.epubButton, "Seçilenleri EPUB Yap", "#795548", "white", "Durum: Hazır"
-        )
-        self.epub_thread = None
-        self.epub_worker = None
-        # cmplt klasörü güncellendiği için listeyi yenilemek isteyebilirsiniz
-        self.update_file_list_from_selection()
-
-    def on_epub_error(self, message):
-        QMessageBox.critical(self, "Hata", message)
-        self._set_ui_state_on_process_end(
-            self.epubButton, "Seçilenleri EPUB Yap", "#FF5722", "white", f"Durum: Hata - {message}"
-        )
-        self.epub_thread = None
-        self.epub_worker = None
-    def update_chapter_check_progress(self, current, total):
-        self.progressBar.setValue(current)
-        self.progressBar.setMaximum(total)
-        self.statusLabel.setText(f"Durum: Kontrol ediliyor... Dosya {current}/{total}")
-
-    def on_chapter_check_finished(self, message):
-        QMessageBox.information(self, "Tamamlandı", message)
-        self.chapter_check_thread = None
-        self.chapter_check_worker = None
-
-    def on_chapter_check_error(self, message):
-        QMessageBox.critical(self, "Hata", message)
-        self.chapter_check_thread = None
-        self.chapter_check_worker = None
-    # ---------------------------------------
-
-    def _set_ui_state_on_process_start(self, button, text, bg_color, text_color, max_progress, status_text):
-        """İşlem başladığında UI durumunu ayarlar."""
-        self.startButton.setEnabled(False)
-        self.splitButton.setEnabled(False)
-        self.downloadMethodCombo.setEnabled(False)
-        self.translateButton.setEnabled(False)
-        self.mergeButton.setEnabled(False)
-        self.projectSettingsButton.setEnabled(False)
-        self.selectHighlightedButton.setEnabled(False)
-        self.token_count_button.setEnabled(False) # Yeni: Token Say butonu devre dışı
-        self.errorCheckButton.setEnabled(False) # Yeni: Hata Kontrol butonu devre dışı
-        button.setEnabled(False) 
-        button.setText(text)
-        button.setStyleSheet(f"background-color: {bg_color}; color: {text_color}; border-radius: 5px; padding: 10px;")
-        self.progressBar.setValue(0)
-        self.progressBar.setMaximum(max_progress)
-        self.progressBar.setVisible(True)
-        self.statusLabel.setText(status_text)
-        self.total_tokens_label.setVisible(False) 
-        self.total_original_tokens_label.setVisible(False)
-        self.total_translated_tokens_label.setVisible(False)
-        self.token_progress_bar.setVisible(False)
-
-    def _set_ui_state_on_process_end(self, button, text, bg_color, text_color, status_text):
-        """İşlem bittiğinde UI durumunu ayarlar."""
-        self.startButton.setEnabled(True)
-        self.splitButton.setEnabled(True)
-        self.downloadMethodCombo.setEnabled(True)
-        self.translateButton.setEnabled(True)
-        self.mergeButton.setEnabled(True)
-        self.epubButton.setEnabled(True)
-        self.projectSettingsButton.setEnabled(True)
-        self.selectHighlightedButton.setEnabled(True)
-        self.token_count_button.setEnabled(True) # Yeni: Token Say butonu aktif
-        self.errorCheckButton.setEnabled(True) # Yeni: Hata Kontrol butonu aktif
-        button.setEnabled(True)
-        button.setText(text)
-        button.setStyleSheet(f"background-color: {bg_color}; color: {text_color}; border-radius: 5px; padding: 10px;")
-        self.progressBar.setVisible(False)
-        self.statusLabel.setText(status_text)
-        # Token bilgileri işlem bittikten sonra görünür olacak (token sayımı zaten tetiklenecek)
-
-
-    def update_file_list_from_selection(self):
-        self.file_table.setRowCount(0)
-        current_item = self.project_list.currentItem()
-        if not current_item:
-            self.current_project_path = None
-            self.downloadMethodCombo.setEnabled(False)
-            self.translateButton.setEnabled(False)
-            self.splitButton.setEnabled(False)
-            self.mergeButton.setEnabled(False)
-            self.projectSettingsButton.setEnabled(False) 
-            self.selectHighlightedButton.setEnabled(False) 
-            self.token_count_button.setEnabled(False) # Proje yoksa pasif
-            # Proje seçili değilken token bilgilerini sıfırla ve gizle
-            self.total_tokens_label.setText("Toplam Token: 0")
-            self.total_original_tokens_label.setText("Orijinal Token: 0")
-            self.total_translated_tokens_label.setText("Çevrilen Token: 0")
-            self.total_tokens_label.setVisible(False)
-            self.total_original_tokens_label.setVisible(False)
-            self.total_translated_tokens_label.setVisible(False)
-            self.token_progress_bar.setVisible(False)
-            return
-
-        project_name = current_item.text()
-        self.current_project_path = os.path.join(os.getcwd(), project_name)
-        config_folder_path = os.path.join(self.current_project_path, 'config') # config klasörünün yolu
-        download_folder = os.path.join(self.current_project_path, 'dwnld')
-        translated_folder = os.path.join(self.current_project_path, 'trslt')
-        completed_folder = os.path.join(self.current_project_path, 'cmplt') 
-
-        self.downloadMethodCombo.setEnabled(True)
-        self.translateButton.setEnabled(True)
-        self.splitButton.setEnabled(True)
-        self.mergeButton.setEnabled(True)
-        self.epubButton.setEnabled(True)
-        self.projectSettingsButton.setEnabled(True) 
-        self.selectHighlightedButton.setEnabled(True) 
-        self.token_count_button.setEnabled(True) # Proje seçilince aktif
-        self.errorCheckButton.setEnabled(True) # Proje seçilince aktif
-
-        # Mevcut token önbelleğini yükle
-        self.project_token_cache = load_token_data(config_folder_path)
-
-        # Hata loglarını yükle
-        translation_errors = {} 
-        error_log_path_translation = os.path.join(translated_folder, 'translation_errors.json')
-        if os.path.exists(error_log_path_translation):
-            try:
-                with open(error_log_path_translation, 'r', encoding='utf-8') as f:
-                    translation_errors = json.load(f)
-            except json.JSONDecodeError as e:
-                print(f"Hata: '{error_log_path_translation}' okunurken JSON hatası: {e}")
-                translation_errors = {}
-            except Exception as e:
-                print(f"Hata: '{error_log_path_translation}' okunurken genel hata: {e}")
-                translation_errors = {}
-
-        cleaning_errors = {}
-        error_log_path_cleaning = os.path.join(translated_folder, 'cleaning_errors.json') 
-        if os.path.exists(error_log_path_cleaning):
-            try:
-                with open(error_log_path_cleaning, 'r', encoding='utf-8') as f:
-                    cleaning_errors = json.load(f)
-            except json.JSONDecodeError as e:
-                print(f"Hata: '{error_log_path_cleaning}' okunurken JSON hatası: {e}")
-                cleaning_errors = {}
-            except Exception as e:
-                print(f"Hata: '{error_log_path_cleaning}' okunurken genel hata: {e}")
-                cleaning_errors = {}
-
-
-        file_data_map = {} 
-
-        # Process downloaded files (originals)
-        if os.path.exists(download_folder):
-            dwnld_files = sorted([f for f in os.listdir(download_folder) if f.endswith('.txt')])
-            for file_name in dwnld_files:
-                original_file_base = file_name.replace(".txt", "")
-                file_path = os.path.join(download_folder, file_name)
-                
-                try:
-                    file_stat = os.stat(file_path)
-                    creation_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(file_stat.st_ctime))
-                    file_size = format_file_size(file_stat.st_size)
-                except Exception:
-                    creation_time, file_size = "Bilinmiyor", "Bilinmiyor"
-
-                # Token bilgisini önbellekten al
-                cached_tokens_data = self.project_token_cache.get("file_token_data", {}).get(file_name, {})
-                original_token_count = cached_tokens_data.get("original_tokens", "Hesaplanmadı") # Yeni varsayılan değer
-                
-                file_data_map[original_file_base] = {
-                    "original_file_name": file_name,
-                    "original_file_path": file_path,
-                    "original_creation_time": creation_time,
-                    "original_file_size": file_size,
-                    "translated_file_name": "", 
-                    "translated_file_path": "",
-                    "translation_status": "Çevrilmedi", 
-                    "cleaning_status": "Temizlenmedi", 
-                    "is_translated": False,
-                    "is_cleaned": False,
-                    "sort_key": original_file_base,
-                    "original_token_count": original_token_count, 
-                    "translated_token_count": "Yok" 
-                }
-                if file_name in cleaning_errors:
-                    file_data_map[original_file_base]["cleaning_status"] = f"Hata: {cleaning_errors[file_name]}"
-
-
-        # Process translated files and update map
-        if os.path.exists(translated_folder):
-            trslt_files = sorted([f for f in os.listdir(translated_folder) if f.startswith('translated_') and f.endswith('.txt')])
-            for translated_file_name in trslt_files:
-                original_file_name_candidate = translated_file_name.replace("translated_", "")
-                original_file_base = original_file_name_candidate.replace(".txt", "")
-                
-                # Token bilgisini önbellekten al
-                cached_tokens_data = self.project_token_cache.get("file_token_data", {}).get(translated_file_name, {})
-                translated_token_count = cached_tokens_data.get("translated_tokens", "Hesaplanmadı") # Yeni varsayılan değer
-
-                if original_file_base in file_data_map:
-                    entry = file_data_map[original_file_base]
-                    entry["translated_file_name"] = translated_file_name
-                    entry["translated_file_path"] = os.path.join(translated_folder, translated_file_name)
-                    entry["is_translated"] = True
-                    entry["translated_token_count"] = translated_token_count 
-                    
-                    if original_file_name_candidate in translation_errors:
-                        entry["translation_status"] = f"Hata: {translation_errors[original_file_name_candidate]}"
-                    else:
-                        entry["translation_status"] = "Çevrildi"
-                    
-                    if translated_file_name in cleaning_errors:
-                        entry["cleaning_status"] = f"Hata: {cleaning_errors[translated_file_name]}"
-
-                else:
-                    translated_file_path = os.path.join(translated_folder, translated_file_name)
-                    try:
-                        file_stat = os.stat(translated_file_path)
-                        creation_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(file_stat.st_ctime))
-                        file_size = format_file_size(file_stat.st_size)
-                    except Exception:
-                        creation_time, file_size = "Bilinmiyor", "Bilinmiyor"
-
-                    file_data_map[original_file_base] = { 
-                        "original_file_name": "Orijinali Yok", 
-                        "original_file_path": "",
-                        "original_creation_time": creation_time, 
-                        "original_file_size": file_size, 
-                        "translated_file_name": translated_file_name,
-                        "translated_file_path": translated_file_path,
-                        "translation_status": "Orijinali Yok", 
-                        "cleaning_status": "Temizlenmedi", 
-                        "is_translated": True,
-                        "is_cleaned": False,
-                        "sort_key": original_file_base,
-                        "original_token_count": "Yok", 
-                        "translated_token_count": translated_token_count 
-                    }
-                    if translated_file_name in cleaning_errors:
-                        file_data_map[original_file_base]["cleaning_status"] = f"Hata: {cleaning_errors[translated_file_name]}"
-
-        # Process completed files (merged files) - these will appear as separate entries
-        if os.path.exists(completed_folder):
-            cmplt_files = sorted([f for f in os.listdir(completed_folder) if f.endswith('.txt')])
-            for file_name in cmplt_files:
-                merged_file_base = f"merged_{file_name.replace('.txt', '')}" 
-                file_path = os.path.join(completed_folder, file_name)
-
-                try:
-                    file_stat = os.stat(file_path)
-                    creation_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(file_stat.st_ctime))
-                    file_size = format_file_size(file_stat.st_size)
-                except Exception:
-                    creation_time, file_size = "Bilinmiyor", "Bilinmiyor"
-                
-                # Token bilgisini önbellekten al
-                cached_tokens_data = self.project_token_cache.get("file_token_data", {}).get(file_name, {})
-                merged_token_count = cached_tokens_data.get("merged_tokens", "Hesaplanmadı") # Yeni varsayılan değer
-
-                file_data_map[merged_file_base] = {
-                    "original_file_name": "N/A", 
-                    "original_file_path": "",
-                    "original_creation_time": creation_time,
-                    "original_file_size": file_size,
-                    "translated_file_name": file_name, # Merged file is shown here
-                    "translated_file_path": file_path,
-                    "translation_status": "Birleştirildi", 
-                    "cleaning_status": "N/A",
-                    "is_translated": False, 
-                    "is_cleaned": False,
-                    "sort_key": merged_file_base,
-                    "original_token_count": "N/A", 
-                    "translated_token_count": merged_token_count 
-                }
-
-        # Combine translation and cleaning status into a single "Durum" for display
-        for key, entry in file_data_map.items():
-            final_status = ""
-            
-            if entry["translation_status"] == "Birleştirildi": 
-                final_status = "Birleştirildi"
-            elif entry["original_file_name"] == "Orijinali Yok":
-                final_status = f"Orijinali Yok, {entry['translation_status']}"
-            elif entry["translation_status"].startswith("Hata:"):
-                final_status = entry["translation_status"] 
-            elif entry["cleaning_status"].startswith("Hata:"):
-                 final_status = entry["cleaning_status"] 
-            elif entry["is_translated"]:
-                final_status = entry["translation_status"] 
-            else:
-                final_status = "İndirildi" 
-
-            entry["display_status"] = final_status
-
-
-        sorted_entries = sorted(file_data_map.values(), key=lambda x: natural_sort_key(x["sort_key"]))
-
-        self.file_table.setRowCount(len(sorted_entries))
-        for row, entry_data in enumerate(sorted_entries):
-            self.populate_table_row(row, entry_data)
-        
-        # Token sayımı burada otomatik başlatılmıyor, sadece butonla tetiklenecek
-        # Ancak toplam token etiketlerini önbellekten yükleyelim (varsa)
-        self.total_original_tokens_label.setText(f"Toplam Orijinal Token: {self.project_token_cache.get('total_original_tokens', 0)}")
-        self.total_translated_tokens_label.setText(f"Toplam Çevrilen Token: {self.project_token_cache.get('total_translated_tokens', 0)}")
-        self.total_tokens_label.setText(f"Toplam Token (Orijinal + Çevrilen): {self.project_token_cache.get('total_combined_tokens', 0)}")
-        
-        self.total_tokens_label.setVisible(True)
-        self.total_original_tokens_label.setVisible(True)
-        self.total_translated_tokens_label.setVisible(True)
-        self.token_progress_bar.setVisible(False)
-
-
-    def populate_table_row(self, row, entry_data):
-        # Column 0: Checkbox
-        checkbox_item = QTableWidgetItem()
-        checkbox_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
-        checkbox_item.setCheckState(Qt.CheckState.Unchecked)
-        self.file_table.setItem(row, 0, checkbox_item)
-
-        # Column 1: Original File Name
-        self.file_table.setItem(row, 1, QTableWidgetItem(entry_data["original_file_name"]))
-
-        # Column 2: Translated File Name
-        self.file_table.setItem(row, 2, QTableWidgetItem(entry_data["translated_file_name"] if entry_data["translated_file_name"] else "Yok"))
-        
-        # Column 3: Creation Date (Original)
-        self.file_table.setItem(row, 3, QTableWidgetItem(entry_data["original_creation_time"]))
-        
-        # Column 4: Size (Original)
-        self.file_table.setItem(row, 4, QTableWidgetItem(entry_data["original_file_size"]))
-        
-        # Column 5: Status 
-        status_text = entry_data["display_status"]
-        status_item = QTableWidgetItem(status_text)
-        
-        if status_text.startswith("Hata:"):
-            status_item.setForeground(QColor(Qt.GlobalColor.red)) 
-        elif status_text == "Çevrildi" or status_text == "Birleştirildi": 
-            status_item.setForeground(QColor(Qt.GlobalColor.darkGreen)) 
-        elif status_text == "Orijinali Yok, Çevrildi":
-            status_item.setForeground(QColor(Qt.GlobalColor.darkGreen)) 
-        elif status_text == "Orijinali Yok":
-            status_item.setForeground(QColor(Qt.GlobalColor.darkMagenta)) 
-        else: 
-            status_item.setForeground(QColor(Qt.GlobalColor.darkGray)) 
-        
-        self.file_table.setItem(row, 5, status_item)
-
-        # Column 6: Original Token Count (Yeni)
-        original_token_item = QTableWidgetItem(str(entry_data["original_token_count"]))
-        if isinstance(entry_data["original_token_count"], str) and "Hesaplanmadı" in entry_data["original_token_count"]:
-            original_token_item.setForeground(QColor(Qt.GlobalColor.blue)) # Henüz hesaplanmadıysa mavi
-        self.file_table.setItem(row, 6, original_token_item)
-        
-        # Column 7: Translated Token Count (Yeni)
-        translated_token_item = QTableWidgetItem(str(entry_data["translated_token_count"]))
-        if isinstance(entry_data["translated_token_count"], str) and ("Hesaplanmadı" in entry_data["translated_token_count"] or "Yok" in entry_data["translated_token_count"]):
-            translated_token_item.setForeground(QColor(Qt.GlobalColor.blue)) # Henüz hesaplanmadıysa/yoksa mavi
-        self.file_table.setItem(row, 7, translated_token_item)
-
-    def start_token_counting_manually(self):
-        """Token sayma işlemini buton aracılığıyla başlatır."""
-        self._start_token_counting()
-
-    def _start_token_counting(self):
-        """Token sayma işlemini arka planda başlatır."""
-        if not self.current_project_path:
-            QMessageBox.warning(self, "Proje Seçilmedi", "Token saymak için lütfen önce bir proje seçin.")
-            return
-
-        # Önceki token sayma işlemi tamamlanmamışsa durdur
-        if self.token_count_thread and self.token_count_thread.isRunning():
-            self.token_count_worker.stop()
-            self.token_count_thread.quit()
-            self.token_count_thread.wait(1000) 
-            self.token_count_thread = None
-            self.token_count_worker = None
-
-        # Sadece seçilen dosyaları belirle
-        selected_files = []
-        for row in range(self.file_table.rowCount()):
-            checkbox_item = self.file_table.item(row, 0)
-            if checkbox_item and checkbox_item.checkState() == Qt.CheckState.Checked:
-                orig_name = self.file_table.item(row, 1).text() if self.file_table.item(row, 1) else ""
-                trans_name = self.file_table.item(row, 2).text() if self.file_table.item(row, 2) else ""
-                
-                if orig_name and orig_name != "Yok" and orig_name != "Orijinali Yok":
-                    selected_files.append(orig_name)
-                    
-                if trans_name and trans_name != "Yok":
-                    selected_files.append(trans_name)
-
-        if not selected_files:
-            QMessageBox.warning(self, "Uyarı", "Lütfen token hesaplanmasını istediğiniz dosyaları kutucuklarından işaretleyin.")
-            return
-
-        config_path = os.path.join(self.current_project_path, 'config', 'config.ini')
-        api_key = ""
-        if os.path.exists(config_path):
-            try:
-                self.config.read(config_path)
-                api_key = self.config.get('API', 'gemini_api_key', fallback="")
-                mcp_endpoint_id = self.config.get('MCP', 'endpoint_id', fallback=None)
-            except configparser.Error:
-                api_key = ""
-                mcp_endpoint_id = None
-        
-        if not api_key and not mcp_endpoint_id:
-            QMessageBox.warning(self, "API Anahtarı / MCP Eksik", "Token sayımı için Gemini API anahtarı veya MCP bağlantısı gereklidir. Lütfen proje ayarlarına girerek yapılandırın.")
-            self.total_tokens_label.setText("Toplam Token: API Anahtarı Yok")
-            self.total_original_tokens_label.setText("Orijinal Token: API Anahtarı Yok")
-            self.total_translated_tokens_label.setText("Çevrilen Token: API Anahtarı Yok")
-            self.token_progress_bar.setVisible(False)
-            self.total_tokens_label.setVisible(True)
-            self.total_original_tokens_label.setVisible(True)
-            self.total_translated_tokens_label.setVisible(True)
-            return
-
-        # Diğer butonları devre dışı bırak
-        self.startButton.setEnabled(False)
-        self.translateButton.setEnabled(False)
-        self.mergeButton.setEnabled(False)
-        self.projectSettingsButton.setEnabled(False)
-        self.selectHighlightedButton.setEnabled(False)
-        self.token_count_button.setEnabled(False) # Kendi butonunu da devre dışı bırak
-        self.token_count_button.setText("Sayılıyor...")
-        self.token_count_button.setStyleSheet("background-color: #FFC107; color: black; border-radius: 5px; padding: 10px;")
-
-        self.token_progress_bar.setValue(0)
-        self.token_progress_bar.setMaximum(0) 
-        self.token_progress_bar.setVisible(True)
-        self.statusLabel.setText("Durum: Token'lar hesaplanıyor...")
-        self.total_tokens_label.setText("Toplam Token: Hesaplıyor...")
-        self.total_original_tokens_label.setText("Orijinal Token: Hesaplıyor...")
-        self.total_translated_tokens_label.setText("Çevrilen Token: Hesaplıyor...")
-        self.total_tokens_label.setVisible(True)
-        self.total_original_tokens_label.setVisible(True)
-        self.total_translated_tokens_label.setVisible(True)
-
-        self.token_count_thread = QThread()
-        # Worker'a mevcut önbelleği, model versiyonunu ve SEÇİLEN DOSYALARI gönderiyoruz
-        gemini_version = self.get_gemini_model_version()
-        self.token_count_worker = TokenCountWorker(self.current_project_path, api_key, self.project_token_cache, gemini_version, selected_files, endpoint_id=mcp_endpoint_id)
-        self.token_count_worker.moveToThread(self.token_count_thread)
-
-        # finished sinyali sıralaması: önce UI güncellemesi, sonra thread temizliği
-        self.token_count_thread.started.connect(self.token_count_worker.run)
-        self.token_count_worker.finished.connect(self._on_token_counting_finished)
-        self.token_count_worker.progress.connect(self._update_token_counting_progress)
-        self.token_count_worker.error.connect(self._on_token_counting_error)
-        # Qt thread yönetimi: finished sonrası temizlik
-        self.token_count_worker.finished.connect(self.token_count_thread.quit)
-        self.token_count_thread.finished.connect(self._cleanup_token_count_thread)
-
-        self.token_count_thread.start()
-        app_logger.info("Token sayım thread'i başlatıldı.")
-
-    def _update_token_counting_progress(self, current, total):
-        self.token_progress_bar.setMaximum(total)
-        self.token_progress_bar.setValue(current)
-        self.statusLabel.setText(f"Durum: Token sayılıyor... Dosya {current}/{total}")
-
-    def _on_token_counting_finished(self, results):
-        import time as _time
-        _t0 = _time.time()
-        app_logger.info("Token sayımı tamamlandı. UI güncelleniyor...")
-
-        self.statusLabel.setText("Durum: Token sayımı tamamlandı.")
-        self.token_progress_bar.setVisible(False)
-        self.token_count_button.setText("Token Say")
-        app_logger.info(f"[PERF] statusLabel+progressBar+btn setText: {_time.time()-_t0:.3f}s")
-
-        self.token_count_button.setStyleSheet("background-color: #673AB7; color: white; border-radius: 5px; padding: 10px;")
-        app_logger.info(f"[PERF] btn setStyleSheet: {_time.time()-_t0:.3f}s")
-
-        self._set_all_buttons_enabled_state(True)
-        app_logger.info(f"[PERF] _set_all_buttons_enabled_state: {_time.time()-_t0:.3f}s")
-
-        # Önbelleği güncelleyelim
-        self.project_token_cache = results
-        config_folder_path = os.path.join(self.current_project_path, 'config')
-        save_token_data(config_folder_path, self.project_token_cache)
-        app_logger.info(f"[PERF] save_token_data: {_time.time()-_t0:.3f}s")
-
-        file_tokens = results['file_token_data']
-        total_original = results['total_original_tokens']
-        total_translated = results['total_translated_tokens']
-        total_combined = results['total_combined_tokens']
-        app_logger.info(f"[PERF] Tablo sat\u0131r say\u0131s\u0131: {self.file_table.rowCount()}")
-
-        # --- Ad\u0131m 1: setSortingEnabled(False) ---
-        app_logger.info(f"[PERF] setSortingEnabled(False) \u00f6ncesi: {_time.time()-_t0:.3f}s")
-        self.file_table.setSortingEnabled(False)
-        app_logger.info(f"[PERF] setSortingEnabled(False) sonras\u0131: {_time.time()-_t0:.3f}s")
-
-        # --- Ad\u0131m 2: setUpdatesEnabled(False) ---
-        self.file_table.setUpdatesEnabled(False)
-        app_logger.info(f"[PERF] setUpdatesEnabled(False) sonras\u0131: {_time.time()-_t0:.3f}s")
-
-        # --- Ad\u0131m 3: model blockSignals ---
-        model = self.file_table.model()
-        model.blockSignals(True)
-        app_logger.info(f"[PERF] model.blockSignals(True) sonras\u0131: {_time.time()-_t0:.3f}s")
-
-        try:
-            for row in range(self.file_table.rowCount()):
-                original_file_name = self.file_table.item(row, 1).text()
-                translated_file_name = self.file_table.item(row, 2).text()
-                status_text = self.file_table.item(row, 5).text()
-
-                original_token_str = "Yok"
-                translated_token_str = "Yok"
-
-                if original_file_name != "Orijinali Yok" and original_file_name != "N/A" and original_file_name in file_tokens:
-                    original_token_val = file_tokens[original_file_name].get("original_tokens")
-                    original_token_str = str(original_token_val) if original_token_val is not None else "Hata/N/A"
-
-                if translated_file_name != "Yok" and translated_file_name != "N/A" and translated_file_name in file_tokens:
-                    if "Birle\u015ftirildi" in status_text:
-                        translated_token_val = file_tokens[translated_file_name].get("merged_tokens")
-                    else:
-                        translated_token_val = file_tokens[translated_file_name].get("translated_tokens")
-                    translated_token_str = str(translated_token_val) if translated_token_val is not None else "Hata/Yok"
-
-                original_token_item = QTableWidgetItem(original_token_str)
-                translated_token_item = QTableWidgetItem(translated_token_str)
-
-                if "Hata" in original_token_str or original_token_str == "N/A":
-                    original_token_item.setForeground(QColor(Qt.GlobalColor.red))
-                if "Hata" in translated_token_str or translated_token_str == "Yok" or translated_token_str == "N/A":
-                    translated_token_item.setForeground(QColor(Qt.GlobalColor.red))
-
-                self.file_table.setItem(row, 6, original_token_item)
-                self.file_table.setItem(row, 7, translated_token_item)
-
-                # \u0130lk 5 sat\u0131r i\u00e7in detayl\u0131 zaman\u00f6l\u00e7\u00fcm\u00fc
-                if row < 5:
-                    app_logger.info(f"[PERF] sat\u0131r {row} setItem tamamland\u0131: {_time.time()-_t0:.3f}s")
-
-        finally:
-            # --- Ad\u0131m 4: model sinyallerini geri a\u00e7 ---
-            app_logger.info(f"[PERF] D\u00f6ng\u00fc bitti, model.blockSignals(False) \u00f6ncesi: {_time.time()-_t0:.3f}s")
-            model.blockSignals(False)
-            app_logger.info(f"[PERF] model.blockSignals(False) sonras\u0131: {_time.time()-_t0:.3f}s")
-
-            # --- Ad\u0131m 5: setSortingEnabled(True) ---
-            app_logger.info(f"[PERF] setSortingEnabled(True) \u00f6ncesi: {_time.time()-_t0:.3f}s")
-            self.file_table.setSortingEnabled(True)
-            app_logger.info(f"[PERF] setSortingEnabled(True) sonras\u0131: {_time.time()-_t0:.3f}s")
-
-            # --- Ad\u0131m 6: setUpdatesEnabled(True) ---
-            self.file_table.setUpdatesEnabled(True)
-            app_logger.info(f"[PERF] setUpdatesEnabled(True) sonras\u0131: {_time.time()-_t0:.3f}s")
-
-            # --- Ad\u0131m 7: viewport().update() ---
-            self.file_table.viewport().update()
-            app_logger.info(f"[PERF] viewport().update() sonras\u0131: {_time.time()-_t0:.3f}s")
-
-        # Genel token bilgilerini g\u00fcncelle
-        self.total_tokens_label.setText(f"Toplam Token (Orijinal + \u00c7evrilen): {total_combined}")
-        self.total_original_tokens_label.setText(f"Toplam Orijinal Token: {total_original}")
-        self.total_translated_tokens_label.setText(f"Toplam \u00c7evrilen Token: {total_translated}")
-        self.total_tokens_label.setVisible(True)
-        self.total_original_tokens_label.setVisible(True)
-        self.total_translated_tokens_label.setVisible(True)
-        app_logger.info(f"[PERF] Token say\u0131m\u0131 UI g\u00fcncellemesi tamamland\u0131: {_time.time()-_t0:.3f}s")
-
-
-    def _cleanup_token_count_thread(self):
-        """Token sayım thread'ini ve worker'ı güvenli şekilde temizler."""
-        app_logger.info("Token sayım thread'i temizleniyor...")
-        if self.token_count_worker:
-            self.token_count_worker.deleteLater()
-            self.token_count_worker = None
-        if self.token_count_thread:
-            self.token_count_thread.deleteLater()
-            self.token_count_thread = None
-        app_logger.info("Token sayım thread'i temizlendi.")
-
-    def _on_token_counting_error(self, message):
-        app_logger.error(f"Token sayım hatası: {message}")
-        QMessageBox.critical(self, "Token Sayım Hatası", f"Token sayımı sırasında bir hata oluştu:\n{message}")
-        self.statusLabel.setText(f"Durum: Token sayım hatası - {message}")
-        self.token_progress_bar.setVisible(False)
-        self.token_count_button.setText("Token Say")
-        self.token_count_button.setStyleSheet("background-color: #673AB7; color: white; border-radius: 5px; padding: 10px;") # Rengi geri yükle
-        self._set_all_buttons_enabled_state(True) # Diğer butonları tekrar aktif et
-
-        self.total_tokens_label.setText("Toplam Token: Hata")
-        self.total_original_tokens_label.setText("Orijinal Token: Hata")
-        self.total_translated_tokens_label.setText("Çevrilen Token: Hata")
-        self.total_tokens_label.setVisible(True)
-        self.total_original_tokens_label.setVisible(True)
-        self.total_translated_tokens_label.setVisible(True)
-
-
-    def _set_all_buttons_enabled_state(self, enabled):
-        """Tüm ana işlem butonlarının etkinliğini ayarlar."""
-        self.startButton.setEnabled(enabled)
-        self.translateButton.setEnabled(enabled)
-        self.mergeButton.setEnabled(enabled)
-        self.errorCheckButton.setEnabled(enabled)
-        self.projectSettingsButton.setEnabled(enabled)
-        self.selectHighlightedButton.setEnabled(enabled)
-        self.token_count_button.setEnabled(enabled)
-
-
-    def add_file_to_table(self, file_path, file_name):
-        pass 
-
-    def save_settings_clicked(self):
-        QMessageBox.information(self, "Kaydet", "Uygulama ayarları (genel) buraya kaydedilecektir. Proje ayarları için 'Proje Ayarları' butonunu kullanın.")
-        print("'Ayarları Kaydet' tıklandı.")
-        
 
     def open_project_settings_dialog(self):
         current_item = self.project_list.currentItem()
         if not current_item:
             QMessageBox.warning(self, "Proje Seçilmedi", "Lütfen ayarlarını düzenlemek istediğiniz bir proje seçin.")
             return
-
         project_name = current_item.text()
         project_path = os.path.join(os.getcwd(), project_name)
         config_path = os.path.join(project_path, 'config', 'config.ini')
-
         project_link = ""
         max_pages = None
         max_retries = 3
-        api_key = ""  # Varsayılan API anahtarı
+        api_key = ""
         startpromt = ""
         gemini_version = self.get_gemini_model_version()
         mcp_endpoint_id = None
         cache_enabled = True
         terminology_enabled = True
-
+        async_enabled = False
+        async_threads = 3
+        batch_enabled = False
+        max_batch_chars = 33000
+        max_chapters_per_batch = 5
         if os.path.exists(config_path):
             try:
                 with open(config_path, 'r', encoding='utf-8') as f:
@@ -2035,466 +359,276 @@ class MainWindow(QMainWindow):
                 mcp_endpoint_id = self.config.get('MCP', 'endpoint_id', fallback=None)
                 cache_enabled = self.config.getboolean('Features', 'cache_enabled', fallback=True)
                 terminology_enabled = self.config.getboolean('Features', 'terminology_enabled', fallback=True)
-            except: pass
-            
+                async_enabled = self.config.getboolean('Features', 'async_enabled', fallback=False)
+                async_threads = self.config.getint('Features', 'async_threads', fallback=3)
+                batch_enabled = self.config.getboolean('Batch', 'batch_enabled', fallback=False)
+                max_batch_chars = self.config.getint('Batch', 'max_batch_chars', fallback=33000)
+                max_chapters_per_batch = self.config.getint('Batch', 'max_chapters_per_batch', fallback=5)
+            except Exception:
+                pass
         self.max_retries = max_retries
-
-        dialog = ProjectSettingsDialog(project_name, project_link, max_pages, api_key, startpromt, gemini_version, self, mcp_endpoint_id=mcp_endpoint_id, cache_enabled=cache_enabled, terminology_enabled=terminology_enabled)
+        dialog = ProjectSettingsDialog(
+            project_name, project_link, max_pages, api_key, startpromt, gemini_version, self,
+            mcp_endpoint_id=mcp_endpoint_id, cache_enabled=cache_enabled,
+            terminology_enabled=terminology_enabled, async_enabled=async_enabled,
+            async_threads=async_threads, batch_enabled=batch_enabled,
+            max_batch_chars=max_batch_chars, max_chapters_per_batch=max_chapters_per_batch,
+        )
         if dialog.exec():
             updated_data = dialog.get_data()
             try:
                 if 'ProjectInfo' not in self.config:
                     self.config['ProjectInfo'] = {}
                 self.config['ProjectInfo']['link'] = updated_data['link']
-                if updated_data['max_pages']: self.config['ProjectInfo']['max_pages'] = str(updated_data['max_pages'])
-                else: 
-                     if 'max_pages' in self.config['ProjectInfo']: del self.config['ProjectInfo']['max_pages']
-                     
-                self.config['ProjectInfo']['max_retries'] = str(updated_data['max_retries'])                     
-                
+                if updated_data['max_pages']:
+                    self.config['ProjectInfo']['max_pages'] = str(updated_data['max_pages'])
+                else:
+                    if 'max_pages' in self.config['ProjectInfo']:
+                        del self.config['ProjectInfo']['max_pages']
+                self.config['ProjectInfo']['max_retries'] = str(updated_data['max_retries'])
                 if 'API' not in self.config:
                     self.config['API'] = {}
                 self.config['API']['gemini_api_key'] = updated_data['api_key']
                 if 'api_key_name' in updated_data and updated_data['api_key_name']:
                     self.config['API']['api_key_name'] = updated_data['api_key_name']
-                
                 if 'Startpromt' not in self.config:
                     self.config['Startpromt'] = {}
                 self.config['Startpromt']['startpromt'] = updated_data['Startpromt']
-                
-                # MCP endpoint kaydet
                 if 'MCP' not in self.config:
                     self.config['MCP'] = {}
                 if updated_data.get('mcp_endpoint_id'):
                     self.config['MCP']['endpoint_id'] = updated_data['mcp_endpoint_id']
                 elif 'endpoint_id' in self.config['MCP']:
                     del self.config['MCP']['endpoint_id']
-                
-                # Cache & Terminology ayarları kaydet
                 if 'Features' not in self.config:
                     self.config['Features'] = {}
                 self.config['Features']['cache_enabled'] = str(updated_data.get('cache_enabled', True))
                 self.config['Features']['terminology_enabled'] = str(updated_data.get('terminology_enabled', True))
-                
+                self.config['Features']['async_enabled'] = str(updated_data.get('async_enabled', False))
+                self.config['Features']['async_threads'] = str(updated_data.get('async_threads', 3))
+                if 'Batch' not in self.config:
+                    self.config['Batch'] = {}
+                self.config['Batch']['batch_enabled'] = str(updated_data.get('batch_enabled', False))
+                self.config['Batch']['max_batch_chars'] = str(updated_data.get('max_batch_chars', 33000))
+                self.config['Batch']['max_chapters_per_batch'] = str(updated_data.get('max_chapters_per_batch', 5))
                 with open(config_path, 'w', encoding='utf-8') as configfile:
                     self.config.write(configfile)
                 QMessageBox.information(self, "Ayarlar Kaydedildi", f"'{project_name}' projesinin ayarları başarıyla kaydedildi.")
-                self.update_file_list_from_selection() 
+                self.update_file_list_from_selection()
             except Exception as e:
                 QMessageBox.critical(self, "Kaydetme Hatası", f"Ayarlar kaydedilirken bir hata oluştu:\n{e}")
 
+    # ─────────────── Dosya Listesi Güncelleme ───────────────
+    def sync_database_if_exists(self):
+        """Toplu dosya işlemleri (Çeviri, İndirme, Bölme) bitiminde veritabanını diske göre günceller."""
+        if not hasattr(self, 'current_project_path') or not self.current_project_path:
+            return
+        
+        try:
+            from core.database_manager import DatabaseManager
+            db_mgr = DatabaseManager(self.current_project_path)
+            if db_mgr.db_exists():
+                from core.file_list_manager import FileListManager
+                legacy_flm = FileListManager(self.current_project_path)
+                db_mgr.sync_directory_to_db(legacy_flm)
+        except Exception as e:
+            from logger import app_logger
+            app_logger.error(f"UI DB Sync Hatası: {e}")
+
+    def update_file_list_from_selection(self):
+        self.file_table.setRowCount(0)
+        current_item = self.project_list.currentItem()
+        if not current_item:
+            self.current_project_path = None
+            self.downloadMethodCombo.setEnabled(False)
+            self.translateButton.setEnabled(False)
+            self.splitButton.setEnabled(False)
+            self.mergeButton.setEnabled(False)
+            self.projectSettingsButton.setEnabled(False)
+            self.selectHighlightedButton.setEnabled(False)
+            if hasattr(self, 'token_count_button'):
+                self.token_count_button.setEnabled(False)
+            if hasattr(self, 'generateTerminologyButton'):
+                self.generateTerminologyButton.setEnabled(False)
+            if hasattr(self, 'total_tokens_label'):
+                self.total_tokens_label.setText("Toplam Token: 0")
+                self.total_original_tokens_label.setText("Orijinal Token: 0")
+                self.total_translated_tokens_label.setText("Çevrilen Token: 0")
+                self.total_tokens_label.setVisible(False)
+                self.total_original_tokens_label.setVisible(False)
+                self.total_translated_tokens_label.setVisible(False)
+            if hasattr(self, 'token_progress_bar'):
+                self.token_progress_bar.setVisible(False)
+            return
+
+        project_name = current_item.text()
+        self.current_project_path = os.path.join(os.getcwd(), project_name)
+        self.downloadMethodCombo.setEnabled(True)
+        self.translateButton.setEnabled(True)
+        self.splitButton.setEnabled(True)
+        self.mergeButton.setEnabled(True)
+        self.epubButton.setEnabled(True)
+        self.projectSettingsButton.setEnabled(True)
+        self.selectHighlightedButton.setEnabled(True)
+        if hasattr(self, 'token_count_button'):
+            self.token_count_button.setEnabled(True)
+        if hasattr(self, 'errorCheckButton'):
+            self.errorCheckButton.setEnabled(True)
+        if hasattr(self, 'generateTerminologyButton'):
+            self.generateTerminologyButton.setEnabled(True)
+
+        from core.file_list_manager import FileListManager
+        from ui.file_table_manager import FileTableManager
+        manager = FileListManager(self.current_project_path)
+        data = manager.get_file_list_data()
+        self.project_token_cache = data['project_token_cache']
+        table_manager = FileTableManager(self.file_table)
+        table_manager.populate(data['sorted_entries'])
+
+        if hasattr(self, 'total_original_tokens_label'):
+            self.total_original_tokens_label.setText(f"Toplam Orijinal Token: {self.project_token_cache.get('total_original_tokens', 0)}")
+            self.total_translated_tokens_label.setText(f"Toplam Çevrilen Token: {self.project_token_cache.get('total_translated_tokens', 0)}")
+            self.total_tokens_label.setText(f"Toplam Token (Orijinal + Çevrilen): {self.project_token_cache.get('total_combined_tokens', 0)}")
+            self.total_tokens_label.setVisible(True)
+            self.total_original_tokens_label.setVisible(True)
+            self.total_translated_tokens_label.setVisible(True)
+        if hasattr(self, 'token_progress_bar'):
+            self.token_progress_bar.setVisible(False)
+
+    # ─────────────── UI State Yardımcıları ───────────────
+    def _set_ui_state_on_process_start(self, button, text, bg_color, text_color, max_progress, status_text):
+        self.startButton.setEnabled(False)
+        self.splitButton.setEnabled(False)
+        self.downloadMethodCombo.setEnabled(False)
+        self.translateButton.setEnabled(False)
+        self.mergeButton.setEnabled(False)
+        self.projectSettingsButton.setEnabled(False)
+        self.selectHighlightedButton.setEnabled(False)
+        self.token_count_button.setEnabled(False)
+        self.errorCheckButton.setEnabled(False)
+        self.generateTerminologyButton.setEnabled(False)
+        button.setEnabled(False)
+        button.setText(text)
+        button.setStyleSheet(f"background-color: {bg_color}; color: {text_color}; border-radius: 5px; padding: 10px;")
+        self.progressBar.setValue(0)
+        self.progressBar.setMaximum(max_progress)
+        self.progressBar.setVisible(True)
+        self.statusLabel.setText(status_text)
+        self.total_tokens_label.setVisible(False)
+        self.total_original_tokens_label.setVisible(False)
+        self.total_translated_tokens_label.setVisible(False)
+        self.token_progress_bar.setVisible(False)
+
+    def _set_ui_state_on_process_end(self, button, text, bg_color, text_color, status_text):
+        self.startButton.setEnabled(True)
+        self.splitButton.setEnabled(True)
+        self.downloadMethodCombo.setEnabled(True)
+        self.translateButton.setEnabled(True)
+        self.mergeButton.setEnabled(True)
+        self.epubButton.setEnabled(True)
+        self.projectSettingsButton.setEnabled(True)
+        self.selectHighlightedButton.setEnabled(True)
+        self.token_count_button.setEnabled(True)
+        self.errorCheckButton.setEnabled(True)
+        self.generateTerminologyButton.setEnabled(True)
+        button.setEnabled(True)
+        button.setText(text)
+        button.setStyleSheet(f"background-color: {bg_color}; color: {text_color}; border-radius: 5px; padding: 10px;")
+        self.progressBar.setVisible(False)
+        self.statusLabel.setText(status_text)
+
+    def _set_all_buttons_enabled_state(self, enabled):
+        self.startButton.setEnabled(enabled)
+        self.translateButton.setEnabled(enabled)
+        self.mergeButton.setEnabled(enabled)
+        self.errorCheckButton.setEnabled(enabled)
+        self.projectSettingsButton.setEnabled(enabled)
+        self.selectHighlightedButton.setEnabled(enabled)
+        self.token_count_button.setEnabled(enabled)
+
+    def update_status_bar(self):
+        self.status_bar_mgr.update()
+
+    # ─────────────── Yardımcı Metotlar ───────────────
+
+    def on_shutdown_checkbox_toggled(self, checked):
+        if checked:
+            reply = QMessageBox.warning(self, "Otomatik Kapatma",
+                                        "İşlem bitince bilgisayar ONAYSIZ kapatılacak.\nDevam?",
+                                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                        QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.No:
+                self.shutdown_checkbox.blockSignals(True)
+                self.shutdown_checkbox.setChecked(False)
+                self.shutdown_checkbox.blockSignals(False)
+
     def show_help_clicked(self):
-        """Yardım bilgilerini gösterme işlevi."""
-        QMessageBox.information(self, "Yardım", self.show_about_dialog())
-        print("'Yardım' tıklandı.")
+        url = "https://github.com/utkucanc/yznvltranslate"
+        QDesktopServices.openUrl(QUrl(url))
 
     def show_about_dialog(self):
-        """Hakkında iletişim kutusunu gösterme işlevi."""
-        QMessageBox.about(self, "Hakkında", 
+        QMessageBox.about(self, "Hakkında",
                           "Novel Çeviri Aracı.\n\n"
                           "Bu uygulama UtkuCanC tarafından webnovel çevirilerini yapay zeka desteği ile çevirisininin yapılması amacıyla geliştirilmiştir.\n\n"
-                          "Sürüm: 1.9.6 (JS dosyalarını kaydetme özelliği eklendi.)\n"
                           "Sürüm: 1.9.7 (Toplu bölüm ekleme özelliği eklendi.)\n"
                           "Sürüm: 1.9.8 (Çalışmayı etkileyen genel hatalar giderildi.)\n"
                           "Sürüm: 1.9.9 (Uygulama genelinde loglama sistemi eklendi. Token sayımı donma ve veri kaybolma hataları giderildi.)\n\n"
                           "Sürüm: 2.0.0 (MCP-API Desteği, JS Selenium İndirme, Cache Desteği, Terminoloji Desteği ve daha fazlası)\n\n"
+                          "Sürüm: 2.1.0 (SRP yeniden yapılandırma, Batch Sistemi(Geliştirilmekte), Asenkron Sistemi, Proje Bazlı SQLite, Sistem iyileştirmesi)\n\n"
                           "Geliştirici: UtkuCanC\n"
                           "Mart 2026\n")
 
-    def table_key_press_event(self, event):
-        """QTableWidget'ta Enter tuşuna basıldığında vurgulanan satırları işaretler."""
-        if event.key() == Qt.Key.Key_Return or event.key() == Qt.Key.Key_Enter:
-            self.mark_highlighted_rows_checked()
-        else:
-            QTableWidget.keyPressEvent(self.file_table, event)
+    
+    # ─────────────── Toast Bildirimi ───────────────
+    def _setup_tray_icon(self):
+        try:
+            from PyQt6.QtWidgets import QSystemTrayIcon
+            if QSystemTrayIcon.isSystemTrayAvailable():
+                self._tray_icon = QSystemTrayIcon(self)
+                icon = QIcon("logo256.ico") if os.path.exists("logo256.ico") else QIcon()
+                self._tray_icon.setIcon(icon)
+                self._tray_icon.show()
+                app_logger.info("Sistem tray ikon kuruldu.")
+        except Exception as e:
+            app_logger.warning(f"Tray ikon kurulamadı: {e}")
 
-    def mark_highlighted_rows_checked(self):
-        """Tabloda vurgulanan satırların onay kutularını işaretler."""
-        selected_rows = set()
-        for item in self.file_table.selectedItems():
-            selected_rows.add(item.row())
-        
-        for row in selected_rows:
-            checkbox_item = self.file_table.item(row, 0)
-            if checkbox_item:
-                checkbox_item.setCheckState(Qt.CheckState.Checked)
+    def show_toast(self, title: str, message: str):
+        try:
+            settings = load_app_settings()
+            if not settings.get("notifications_enabled", True):
+                return
+            from PyQt6.QtWidgets import QSystemTrayIcon
+            if self._tray_icon and self._tray_icon.isVisible():
+                self._tray_icon.showMessage(title, message, QSystemTrayIcon.MessageIcon.Information, 5000)
+                app_logger.info(f"Toast bildirimi gönderildi: {title} — {message}")
+        except Exception as e:
+            app_logger.debug(f"Toast bildirimi gönderilemedi: {e}")
 
-    def on_file_table_double_click(self, row, column):
-        """Dosya tablosunda çift tıklama ile metin düzenleyici açar."""
-        if not self.current_project_path:
-            return
-        
-        if column not in (1, 2):  # Sadece Orijinal ve Çevrilen sütunları
-            return
-        
-        item = self.file_table.item(row, column)
-        if not item:
-            return
-        
-        file_name = item.text()
-        if file_name in ("Yok", "Orijinali Yok", "N/A"):
-            return
-        
-        # Dosya yolunu belirle
-        if column == 1:
-            file_path = os.path.join(self.current_project_path, 'dwnld', file_name)
-        else:  # column == 2
-            status = self.file_table.item(row, 5).text() if self.file_table.item(row, 5) else ""
-            if "Birleştirildi" in status:
-                file_path = os.path.join(self.current_project_path, 'cmplt', file_name)
-            else:
-                file_path = os.path.join(self.current_project_path, 'trslt', file_name)
-        
-        if os.path.exists(file_path):
-            editor = TextEditorDialog(file_path, self, project_path=self.current_project_path)
-            editor.exec()
-        else:
-            QMessageBox.warning(self, "Dosya Bulunamadı", f"Dosya bulunamadı:\n{file_path}")
+    def _notify_translation_complete(self, total_files: int):
+        self.show_toast("✅ Çeviri Tamamlandı", f"{total_files} dosya başarıyla çevrildi.")
 
-    def file_table_context_menu(self, position):
-        """Dosya tablosu için sağ tıklama menüsünü oluşturur ve görüntüler."""
-        # Tıklanan hücrenin indeksini al
-        index = self.file_table.indexAt(position)
-        if not index.isValid():
-            return
-
-        row = index.row()
-        column = index.column() # Tıklanan sütun indeksi
-
-        menu = QMenu(self)
-
-        # "Dosyayı Aç" eylemi - tıklanan sütuna göre dosya seçimi
-        open_file_action = QAction("Dosyayı Aç", self)
-        open_file_action.triggered.connect(lambda: self.open_selected_file(row, column))
-        menu.addAction(open_file_action)
-
-        # "Klasörü Aç" eylemi - tıklanan sütuna göre klasör seçimi
-        open_folder_action = QAction("Klasörü Aç", self)
-        open_folder_action.triggered.connect(lambda: self.open_selected_folder(row, column))
-        menu.addAction(open_folder_action)
-
-        menu.exec(self.file_table.viewport().mapToGlobal(position))
-
-    def open_selected_file(self, row, clicked_column):
-        """Seçili dosyayı varsayılan programıyla açar."""
-        if not self.current_project_path:
-            QMessageBox.warning(self, "Hata", "Lütfen önce bir proje seçin.")
-            return
-
-        original_file_name = self.file_table.item(row, 1).text()
-        translated_file_name = self.file_table.item(row, 2).text()
-        status = self.file_table.item(row, 5).text()
-
-        file_path_to_open = None
-
-        # Tıklanan sütuna göre öncelik ver
-        if clicked_column == 1 or clicked_column == 6: # Orijinal dosya veya Orijinal Token sütunu
-            if original_file_name and original_file_name != "Orijinali Yok" and original_file_name != "N/A":
-                file_path_to_open = os.path.join(self.current_project_path, 'dwnld', original_file_name)
-        elif clicked_column == 2 or clicked_column == 7: # Çevrilen dosya veya Çevrilen Token sütunu
-            if status == "Birleştirildi":
-                if translated_file_name and translated_file_name != "Yok":
-                    file_path_to_open = os.path.join(self.current_project_path, 'cmplt', translated_file_name)
-            elif translated_file_name and translated_file_name != "Yok":
-                file_path_to_open = os.path.join(self.current_project_path, 'trslt', translated_file_name)
-        else: # Diğer sütunlar için mevcut mantık
-            if status == "Birleştirildi":
-                if translated_file_name and translated_file_name != "Yok":
-                    file_path_to_open = os.path.join(self.current_project_path, 'cmplt', translated_file_name)
-            elif translated_file_name and translated_file_name != "Yok" and ("Çevrildi" in status or status.startswith("Hata:") or "Temizlenmedi" in status or "Temizlendi" in status):
-                file_path_to_open = os.path.join(self.current_project_path, 'trslt', translated_file_name)
-            elif original_file_name and original_file_name != "Orijinali Yok" and ("İndirildi" in status or status.startswith("Hata:")):
-                file_path_to_open = os.path.join(self.current_project_path, 'dwnld', original_file_name)
-        
-        if file_path_to_open and os.path.exists(file_path_to_open):
-            try:
-                if sys.platform == "win32":
-                    os.startfile(file_path_to_open)
-                elif sys.platform == "darwin": 
-                    subprocess.run(["open", file_path_to_open])
-                else: 
-                    subprocess.run(["xdg-open", file_path_to_open])
-            except Exception as e:
-                QMessageBox.critical(self, "Dosya Açma Hatası", f"Dosya açılamadı:\n{e}")
-        else:
-            QMessageBox.warning(self, "Dosya Bulunamadı", "Seçilen dosyanın yolu mevcut değil veya dosya bulunamadı.")
-
-
-    def open_selected_folder(self, row, clicked_column):
-        """Seçili dosyayı içeren klasörü açar."""
-        if not self.current_project_path:
-            QMessageBox.warning(self, "Hata", "Lütfen önce bir proje seçin.")
-            return
-            
-        original_file_name = self.file_table.item(row, 1).text()
-        translated_file_name = self.file_table.item(row, 2).text()
-        status = self.file_table.item(row, 5).text()
-
-        folder_path_to_open = None
-
-        # Tıklanan sütuna göre klasör seçimi
-        if clicked_column == 1 or clicked_column == 6: # Orijinal dosya veya Orijinal Token sütunu
-            if original_file_name and original_file_name != "Orijinali Yok" and original_file_name != "N/A":
-                folder_path_to_open = os.path.join(self.current_project_path, 'dwnld')
-        elif clicked_column == 2 or clicked_column == 7: # Çevrilen dosya veya Çevrilen Token sütunu
-            if status == "Birleştirildi":
-                if translated_file_name and translated_file_name != "Yok":
-                    folder_path_to_open = os.path.join(self.current_project_path, 'cmplt')
-            elif translated_file_name and translated_file_name != "Yok":
-                folder_path_to_open = os.path.join(self.current_project_path, 'trslt')
-        else: # Diğer sütunlar için mevcut mantık
-            if status == "Birleştirildi":
-                if translated_file_name and translated_file_name != "Yok":
-                    folder_path_to_open = os.path.join(self.current_project_path, 'cmplt')
-            elif translated_file_name and translated_file_name != "Yok" and ("Çevrildi" in status or status.startswith("Hata:")):
-                folder_path_to_open = os.path.join(self.current_project_path, 'trslt')
-            elif original_file_name and original_file_name != "Orijinali Yok" and ("İndirildi" in status or status.startswith("Hata:")):
-                folder_path_to_open = os.path.join(self.current_project_path, 'dwnld')
-
-
-        if folder_path_to_open and os.path.exists(folder_path_to_open):
-            try:
-                if sys.platform == "win32":
-                    os.startfile(folder_path_to_open)
-                elif sys.platform == "darwin": 
-                    subprocess.run(["open", folder_path_to_open])
-                else: 
-                    subprocess.run(["xdg-open", folder_path_to_open])
-            except Exception as e:
-                QMessageBox.critical(self, "Klasör Açma Hatası", f"Klasör açılamadı:\n{e}")
-        else:
-            QMessageBox.warning(self, "Klasör Bulunamadı", "Seçilen dosyanın klasör yolu mevcut değil veya klasör bulunamadı.")
-
-
-    # ────── Yeni Metotlar: Arama, Durdurma, Hata Kontrol, Status Bar ──────
-
-    def filter_project_list(self, text):
-        """Proje listesini filtreler."""
-        search = text.lower()
-        for i in range(self.project_list.count()):
-            item = self.project_list.item(i)
-            item.setHidden(search not in item.text().lower() if search else False)
-
-    def filter_file_table(self, text):
-        """Dosya tablosunu filtreler."""
-        search = text.lower()
-        for row in range(self.file_table.rowCount()):
-            match = False
-            for col in range(1, 3):  # Orijinal ve Çevrilen sütunları
-                item = self.file_table.item(row, col)
-                if item and search in item.text().lower():
-                    match = True
-                    break
-            self.file_table.setRowHidden(row, not match if search else False)
-
-    def stop_translation_process(self):
-        """Çeviriyi tamamen durdurur."""
-        if self.translation_worker and self.translation_thread and self.translation_thread.isRunning():
-            reply = QMessageBox.question(
-                self, 'Çeviriyi Durdur',
-                "Çeviri işlemini durdurmak istediğinize emin misiniz?\nTüm çevrilen dosyalar korunacaktır.",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No
-            )
-            if reply == QMessageBox.StandardButton.Yes:
-                self.translation_worker.stop()
-                self.statusLabel.setText("Durum: Çeviri durduruluyor...")
-                self.stopTranslationButton.setEnabled(False)
-
-    def start_error_check_process(self):
-        """Çeviri hata kontrolü başlatır (Korece/Çince karakter oranı)."""
-        if not self.current_project_path:
-            QMessageBox.warning(self, "Proje Seçilmedi", "Lütfen bir proje seçin.")
-            return
-
-        trslt_folder = os.path.join(self.current_project_path, 'trslt')
-        if not os.path.exists(trslt_folder):
-            QMessageBox.warning(self, "Klasör Yok", "Çeviri klasörü (trslt) bulunamadı.")
-            return
-
-        report_folder = os.path.join(self.current_project_path, 'trslt', 'hata_kontrol')
-
-        self._set_all_buttons_enabled_state(False)
-        self.statusLabel.setText("Durum: Çeviri hata kontrolü yapılıyor...")
-        self.progressBar.setValue(0)
-        self.progressBar.setMaximum(0)
-        self.progressBar.setVisible(True)
-
-        self.error_check_thread = QThread()
-        self.error_check_worker = TranslationErrorCheckWorker(trslt_folder, report_folder)
-        self.error_check_worker.moveToThread(self.error_check_thread)
-
-        self.error_check_thread.started.connect(self.error_check_worker.run)
-        self.error_check_worker.finished.connect(self.on_error_check_finished)
-        self.error_check_worker.error.connect(self.on_error_check_error)
-        self.error_check_worker.progress.connect(self.on_error_check_progress)
-        self.error_check_worker.finished.connect(self.error_check_thread.quit)
-        self.error_check_worker.finished.connect(self.error_check_worker.deleteLater)
-        self.error_check_thread.finished.connect(self.error_check_thread.deleteLater)
-
-        self.error_check_thread.start()
-
-    def on_error_check_progress(self, current, total):
-        self.progressBar.setMaximum(total)
-        self.progressBar.setValue(current)
-        self.statusLabel.setText(f"Durum: Hata kontrolü... Dosya {current}/{total}")
-
-    def on_error_check_finished(self, results):
-        self._set_all_buttons_enabled_state(True)
-        self.progressBar.setVisible(False)
-        self.statusLabel.setText("Durum: Hazır")
-
-        high = results.get("high", [])
-        low = results.get("low", [])
-        report_path = results.get("report_path", "")
-
-        if not high:
-            QMessageBox.information(
-                self, "Hata Kontrolü Tamamlandı",
-                f"Hiçbir çevrilmiş dosyada yüksek Korece/Çince karakter oranı bulunamadı.\n"
-                f"Düşük oranlı dosya sayısı: {len(low)}\n"
-                f"Rapor: {report_path}"
-            )
-        else:
-            file_list_str = "\n".join([f"  - {f['filename']} (Korece: {f['korean_ratio']*100:.1f}%, Çince: {f['chinese_ratio']*100:.1f}%)" for f in high[:20]])
-            reply = QMessageBox.question(
-                self, 'Çeviri Hata Kontrolü',
-                f"Yüksek Korece/Çince oranı bulunan {len(high)} dosya var:\n\n"
-                f"{file_list_str}\n\n"
-                f"Bu dosyaları silmek istiyor musunuz?\n"
-                f"(Raporlar {report_path} içinde kaydedildi)",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No
-            )
-            if reply == QMessageBox.StandardButton.Yes:
-                deleted_count = 0
-                for f_info in high:
-                    try:
-                        os.remove(f_info['filepath'])
-                        deleted_count += 1
-                    except Exception:
-                        pass
-                QMessageBox.information(self, "Silindi", f"{deleted_count} dosya silindi.")
-                self.update_file_list_from_selection()
-
-        self.error_check_thread = None
-        self.error_check_worker = None
-
-    def on_error_check_error(self, message):
-        self._set_all_buttons_enabled_state(True)
-        self.progressBar.setVisible(False)
-        self.statusLabel.setText("Durum: Hazır")
-        QMessageBox.critical(self, "Hata Kontrol Hatası", message)
-        self.error_check_thread = None
-        self.error_check_worker = None
-
-    def _create_status_bar(self):
-        """Uygulama alt bilgi barını oluşturur."""
-        from PyQt6.QtWidgets import QFrame
-        
-        status_frame = QFrame()
-        status_frame.setFrameShape(QFrame.Shape.StyledPanel)
-        status_frame.setStyleSheet("""
-            QFrame {
-                background-color: #263238;
-                color: #B0BEC5;
-                border-top: 1px solid #37474F;
-                padding: 2px 8px;
-            }
-            QLabel {
-                color: #B0BEC5;
-                font-size: 9pt;
-            }
-        """)
-        status_frame.setFixedHeight(30)
-        
-        bar_layout = QHBoxLayout(status_frame)
-        bar_layout.setContentsMargins(8, 0, 8, 0)
-        bar_layout.setSpacing(15)
-        
-        self.sb_status_label = QLabel("🟢 Hazır")
-        self.sb_model_label = QLabel("🤖 Model: -")
-        self.sb_api_label = QLabel("🔑 API: -")
-        self.sb_speed_label = QLabel("⚡ Hız: -")
-        self.sb_requests_label = QLabel("📡 İstek: 0")
-        self.sb_tokens_label = QLabel("📊 Token: 0")
-        
-        self.sb_refresh_btn = QPushButton("↻")
-        self.sb_refresh_btn.setFixedWidth(30)
-        self.sb_refresh_btn.setStyleSheet("color: #80CBC4; background: transparent; border: none; font-size: 12pt;")
-        self.sb_refresh_btn.setToolTip("UI Yeniden Yükle")
-        self.sb_refresh_btn.clicked.connect(self.update_file_list_from_selection)
-        
-        bar_layout.addWidget(self.sb_status_label)
-        bar_layout.addWidget(self.sb_model_label)
-        bar_layout.addWidget(self.sb_api_label)
-        bar_layout.addWidget(self.sb_speed_label)
-        bar_layout.addWidget(self.sb_requests_label)
-        bar_layout.addWidget(self.sb_tokens_label)
-        bar_layout.addStretch()
-        bar_layout.addWidget(self.sb_refresh_btn)
-        
-        self.outer_layout.addWidget(status_frame)
-
-    def update_status_bar(self):
-        """Status bar bilgilerini günceller."""
-        status_icon = "🟢" if self._current_status == "Hazır" else "🟡"
-        self.sb_status_label.setText(f"{status_icon} {self._current_status}")
-        self.sb_model_label.setText(f"🤖 Model: {self._current_model or '-'}")
-        self.sb_api_label.setText(f"🔑 API: {self._current_api_name or '-'}")
-        
-        # Güncel API istek sayısını al
-        current_req_count = self.request_counter_manager.get_count(self._current_model, self._current_api_name)
-        self.sb_requests_label.setText(f"📡 İstek: {current_req_count}")
-        
-        self.sb_tokens_label.setText(f"📊 Token: {self._api_token_count}")
-        if self._translation_speed > 0:
-            self.sb_speed_label.setText(f"⚡ Hız: {self._translation_speed:.1f} dk/bölüm")
-        else:
-            self.sb_speed_label.setText("⚡ Hız: -")
-
+    # ─────────────── Kapatma ───────────────
     def closeEvent(self, event):
-        """Uygulama kapatılırken çalışan tüm indirme veya çevirme işlemlerini durdurur."""
-        running_threads = []
-        if self.download_thread and self.download_thread.isRunning():
-            running_threads.append(self.download_worker)
-        if self.translation_thread and self.translation_thread.isRunning():
-            running_threads.append(self.translation_worker)
-        if self.cleaning_thread and self.cleaning_thread.isRunning():
-            running_threads.append(self.cleaning_worker)
-        if self.merging_thread and self.merging_thread.isRunning():
-            running_threads.append(self.merging_worker)
-        if self.token_count_thread and self.token_count_thread.isRunning(): 
-            running_threads.append(self.token_count_worker)
-        if self.chapter_check_thread and self.chapter_check_thread.isRunning(): # Yeni thread
-            running_threads.append(self.chapter_check_worker)
-        if self.epub_thread and self.epub_thread.isRunning():
-            running_threads.append(self.epub_worker)
-        if running_threads:
-            reply = QMessageBox.question(self, 'Uygulamayı Kapat', 
+        controllers = [
+            self.download_ctrl, self.translation_ctrl, self.cleaning_ctrl,
+            self.merge_ctrl, self.token_ctrl, self.chapter_check_ctrl,
+            self.epub_ctrl, self.error_check_ctrl, self.split_ctrl
+        ]
+        running = [c for c in controllers if c.is_running()]
+        if running:
+            reply = QMessageBox.question(self, 'Uygulamayı Kapat',
                                          "Devam eden işlemler var. Çıkmak istediğinizden emin misiniz? Tüm işlemler durdurulacaktır.",
-                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, 
+                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                          QMessageBox.StandardButton.No)
             if reply == QMessageBox.StandardButton.Yes:
-                for worker in running_threads:
-                    worker.stop()
-                
-                for _ in range(5): 
-                    all_stopped = True
-                    if self.download_thread and self.download_thread.isRunning(): all_stopped = False
-                    if self.translation_thread and self.translation_thread.isRunning(): all_stopped = False
-                    if self.cleaning_thread and self.cleaning_thread.isRunning(): all_stopped = False
-                    if self.merging_thread and self.merging_thread.isRunning(): all_stopped = False
-                    if self.token_count_thread and self.token_count_thread.isRunning(): all_stopped = False
-                    if self.chapter_check_thread and self.chapter_check_thread.isRunning(): all_stopped = False # Yeni thread
-
-                    if all_stopped:
+                for c in running:
+                    c.stop()
+                for _ in range(5):
+                    if not any(c.is_running() for c in controllers):
                         break
-                    time.sleep(1) 
-
-                if not all_stopped:
-                    print("Uyarı: Bazı iş parçacıkları hala çalışıyor. Zorla sonlandırılıyor.")
-                    sys.exit() 
+                    time.sleep(1)
+                else:
+                    sys.exit()
                 event.accept()
             else:
                 event.ignore()

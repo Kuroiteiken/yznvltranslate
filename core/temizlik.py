@@ -1,5 +1,6 @@
 import os
 import re
+from logger import app_logger
 
 def temizle_ve_kaydet(dosya_adi: str) -> tuple[bool, str]:
     """
@@ -53,31 +54,31 @@ if __name__ == "__main__":
         f.write("**Bölüm 1:** Buradan sonrası kalmalı.\n")
         f.write("Bu da bölümün bir parçası.\n")
     
-    print(f"'{test_file_name}' temizleniyor...")
+    app_logger.info(f"'{test_file_name}' temizleniyor...")
     basarili, mesaj = temizle_ve_kaydet(test_file_name)
     if basarili:
-        print(f"✓ '{test_file_name}': Başarılı. Bölüm başlığı: {mesaj}")
+        app_logger.info(f"✓ '{test_file_name}': Başarılı. Bölüm başlığı: {mesaj}")
         with open(test_file_name, 'r', encoding='utf-8') as f:
-            print("\nTemizlenmiş içerik:")
-            print(f.read())
+            app_logger.info("\nTemizlenmiş içerik:")
+            app_logger.info(f.read())
     else:
-        print(f"✗ '{test_file_name}': Hata/Uyarı: {mesaj}")
+        app_logger.error(f"✗ '{test_file_name}': Hata/Uyarı: {mesaj}")
 
     # Olmayan bir dosyayı deneme
-    print("\nOlmayan bir dosyayı deneme:")
+    app_logger.info("\nOlmayan bir dosyayı deneme:")
     basarili, mesaj = temizle_ve_kaydet("olmayan_dosya.txt")
-    print(f"✗ olmayan_dosya.txt: {mesaj}")
+    app_logger.error(f"✗ olmayan_dosya.txt: {mesaj}")
 
     # Sadece bölüm başlığı olmayan bir dosya denemesi
-    print("\nBölüm başlığı olmayan bir dosyayı deneme:")
+    app_logger.info("\nBölüm başlığı olmayan bir dosyayı deneme:")
     test_file_no_chapter = "test_no_chapter.txt"
     with open(test_file_no_chapter, 'w', encoding='utf-8') as f:
         f.write("Bu dosyada bölüm başlığı yok.\n")
         f.write("Tamamen silinmemeli, olduğu gibi kalmalı.\n")
     basarili, mesaj = temizle_ve_kaydet(test_file_no_chapter)
     if basarili:
-        print(f"✓ '{test_file_no_chapter}': Başarılı. Bölüm başlığı: {mesaj}")
+        app_logger.info(f"✓ '{test_file_no_chapter}': Başarılı. Bölüm başlığı: {mesaj}")
     else:
-        print(f"✗ '{test_file_no_chapter}': Hata/Uyarı: {mesaj}")
+        app_logger.error(f"✗ '{test_file_no_chapter}': Hata/Uyarı: {mesaj}")
     os.remove(test_file_name)
     os.remove(test_file_no_chapter)

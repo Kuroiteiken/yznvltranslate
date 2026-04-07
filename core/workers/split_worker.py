@@ -3,6 +3,10 @@ import re
 from PyQt6.QtCore import QObject, pyqtSignal
 
 class SplitWorker(QObject):
+    """
+    İndirilen toplu bölüm dosyasını "## Bölüm - X ##" başlıklarına göre bölerek ayrı dosyalar oluşturur.
+    
+    """
     finished = pyqtSignal()
     progress = pyqtSignal(int, int) # (current, total)
     error = pyqtSignal(str)

@@ -2,6 +2,7 @@ import os
 import datetime
 from PyQt6.QtCore import QObject, pyqtSignal
 from ebooklib import epub
+from logger import app_logger
 
 class EpubWorker(QObject):
     """
@@ -70,7 +71,7 @@ class EpubWorker(QObject):
                     chapters.append(chapter)
 
                 except Exception as e:
-                    print(f"Uyarı: {file_name} işlenirken hata: {e}")
+                    app_logger.warning(f"Uyarı: {file_name} işlenirken hata: {e}")
                 
                 self.progress.emit(i + 1, total_files)
 

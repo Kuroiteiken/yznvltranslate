@@ -4,7 +4,7 @@ from PyQt6.QtCore import pyqtSignal, QObject
 from logger import app_logger
 
 # Temizlik fonksiyonunu içe aktarıyoruz
-from temizlik import temizle_ve_kaydet 
+from core.temizlik import temizle_ve_kaydet 
 
 class CleaningWorker(QObject):
     """

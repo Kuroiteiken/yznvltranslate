@@ -1,10 +1,13 @@
 # Novel Çeviri Aracı - Yapay Zeka Destekli Novel Çeviri ve Düzenleme Uygulaması
+[![GitHub Issues](https://img.shields.io/github/issues/utkucanc/yznvltranslate?label=Open%20Issues)](https://github.com/utkucanc/yznvltranslate/issues)
+[![downloads](https://img.shields.io/github/downloads/utkucanc/yznvltranslate/total?label=Total%20Downloads)](https://github.com/utkucanc/yznvltranslate/releases)
+[![downloads-latest](https://img.shields.io/github/downloads/utkucanc/yznvltranslate/latest/total?label=Latest%20release)](https://github.com/utkucanc/yznvltranslate/releases/latest)
 # NCA
 
 Bu proje, yabancı dildeki (özellikle İngilizce, Korece, Çince gibi) web romanlarını (novel) indirmek, Google Gemini API kullanarak yerel bağlantıda toplu çevirisini yapmak ve sonrasında bu metinleri temizleyip EPUB veya benzeri formatlarda birleştirmek için tasarlanmış, PyQt6 tabanlı masaüstü bir uygulamadır.
 ## Nasıl Kullanılır?
-- Youtube Video Linki:
-https://youtu.be/4HQpAn_qiBU
+- [![Youtube Video Link](https://img.shields.io/badge/Youtube%20Video%20Link-red?style=for-the-badge&logo=youtube)](https://youtu.be/4HQpAn_qiBU)
+- https://youtu.be/4HQpAn_qiBU
 ## Özellikler
 
 * **Toplu İndirme**: 
@@ -16,25 +19,21 @@ https://youtu.be/4HQpAn_qiBU
   - Otomatik **Translation Cache** ve **Terminology Memory** ile maliyet tasarrufu ve terim tutarlılığı.
   - **Prompt Generator (PromtGen)** ile projeye özel (Literal/Natural/Balanced) çeviri promptlarının AI tarafından otomatik çıkarılması.
   - Çevirilerde Çince/Korece (CJK) oranını tarayarak hatalı çıktıları engelleyen karakter koruma sistemi.
+  - **Paragraf Bazlı Çeviri (v2.1.0):** Cache aktif olsun olmasın her dosya otomatik olarak paragraflara bölünür; her paragraf bağımsız çevrilip birleştirilir. Büyük dosyalarda token verimliliğini artırır.
+  - **Asenkron Çeviri (V2.1.0):** Proje ayarları kısmından sayısı düzenlenebilir paralel çeviri sistemi. Aynı anda API isteği göndererek birden fazla dosyanın çeviri yapılabilmesine imkan sağlar.(Gemini için worker sayısı 3 tavsiye edilmektedir. 3 Worker RPM değeri 11-12 aralığındadır.)
+  - **Toplu Çeviri / Batch Mode (v2.1.0 - Test):** Birden fazla bölümü `===CHAPTER_START===` / `===CHAPTER_END===` ayraçlarıyla tek bir API isteğine paketler. Aynı RPD kotasıyla daha fazla bölüm çevrilmesini sağlar. Parse başarısız olursa otomatik tekli moda düşer.
 * **Dosya Manipülasyonu**:
   - `Toplu Bölüm Ekle`: Büyük boyutlu `.txt` dosyalarını "## Bölüm - X ##" ayracı baz alınarak otomatik parçalara ayırma.
   - Geliştirilmiş çift tıklama ile açılan Metin Düzenleyici (Text Editor) üzerinden anlık düzeltme.
   - Çevrilmiş bölümleri tek bir `.txt` veya `.epub` formatında birleştirme.
-* **Token ve Limit Sayacı**: Akıllı durum çubuğu ile maliyet hesaplama, hız takibi ve kalıcı API istek istatistikleri.
+* **Token ve Limit Sayacı**: Akıllı durum çubuğu ile maliyet hesaplama, hız takibi ve kalıcı API istek istatistikleri. Grafik ve tablo olarak api istek sayısı listeleme.
 
 ## Gereksinimler
 
 Programın kaynak koddan çalıştırılabilmesi için sisteminizde aşağıdaki kütüphanelerin yüklü olması gerekir:
 
 ```bash
-pip install PyQt6
-pip install requests
-pip install beautifulsoup4
-pip install google-genai
-pip install selenium
-pip install webdriver-manager
-pip install cx_Freeze
-pip install jieba
+pip install -r requirements.txt
 ```
 
 Not: JavaScript tabanlı Booktoki ve 69shuba indirmelerini (Selenium) kullanmak için bilgisayarınızda Google Chrome tarayıcısı yüklü olmalıdır. `webdriver-manager` aracı ChromeDriver eşleştirmelerini kendi kendine yapacaktır.
@@ -85,11 +84,30 @@ Uygulamanın düzgün çalışabilmesi için veritabanı benzeri dosyaları `App
 * `AppConfigs/app.log`: Uygulama genelinde oluşturulan log/izleme dosyası. Hata ayıklama için kullanışlıdır. *(v1.9.9)*
 
 Her "Yeni Proje" oluşturduğunuzda uygulama, uygulamanın kurulu olduğu dizinde veya seçtiğiniz hedefte o projeye özel alt klasörler oluşturur (`dwnld`, `trslt`, `cmplt` vs.) ve indirmeleri, çevirileri birbirine karışmadan bu ortamların içinde saklar.
-
+## Dizin Ağacı
+```text
+yznvltranslate-main/
+├── AppConfigs/         # Uygulama yapılandırması ve günlükler
+├── cache/             # Çeviri önbellek yönetimi
+├── core/              # Çekirdek iş mantığı
+│   └── workers/       # Çeviri görevleri için asenkron işçiler
+├── terminology/       # Terminoloji yönetimi
+├── ui/                # Kullanıcı arayüzü bileşenleri ve diyaloglar
+├── main_window.py     # Ana Giriş Noktası
+├── dialogs.py         # Genel diyaloglar
+├── logger.py          # Günlük tutma yapılandırması
+├── 69shuba.js         # Kazıyıcı Mantığı
+├── booktoki.js        # Kazıyıcı Mantığı
+├── novelfire.js       # Kazıyıcı Mantığı
+├── requirements.txt   # Bağımlılıklar
+├── setup.py           # Kurulum betiği
+└── file-tree.md       # Proje dizin yapısı ve temel dosyalar hakkında açıklama
+```
 ## Sürüm Geçmişi
 
 | Sürüm | Değişiklikler |
-|-------|--------------|
+|-------|--------------| 
+| 2.1.0 | **Paragraf Bazlı Çeviri** standart hale getirildi (cache bağımsız). **Toplu Çeviri (Batch Mode)** eklendi: birden fazla bölümü tek API isteğinde göndererek aynı RPD ile daha fazla bölüm çevirme. **Asenkron Çeviri** eklendi. Aynı anda birden fazla API isteği göndererek daha hızlı çeviri yapılabilir. Proje Ayarlarından aktif/deaktif edilebilir. |
 | 2.0.0 | Majör Güncelleme! MCP Mimarisi, Prompt Generator, Translation Cache, Terminology Memory, Yeni GenAI SDK, CJK Çeviri Hata Kontrolü ve gelişmiş Metin Düzenleyicisi eklendi. |
 | 1.9.9 | Uygulama genelinde `logger.py` ile loglama sistemi eklendi. Token sayımı sonrasında oluşan UI donma hatası giderildi. Token verisi kısmi sayımda sıfırlanma (veri kaybı) sorunu çözüldü. |
 | 1.9.8 | Çalışmayı etkileyen genel hatalar giderildi (retry_count, statusLabel wordwrap, cx_Freeze base). |

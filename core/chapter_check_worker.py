@@ -1,5 +1,6 @@
 import os
 from PyQt6.QtCore import QObject, pyqtSignal
+from logger import app_logger
 
 class ChapterCheckWorker(QObject):
     """
@@ -72,7 +73,7 @@ class ChapterCheckWorker(QObject):
                         pass
 
                 except Exception as e:
-                    print(f"Hata ({filename}): {e}")
+                    app_logger.error(f"Hata ({filename}): {e}")
                 
                 self.progress.emit(i + 1, total_files)
 

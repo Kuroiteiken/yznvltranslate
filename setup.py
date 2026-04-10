@@ -10,6 +10,9 @@ print("build             = Çalıştırılabilir dosya (CeviriUygulamasi.exe) ol
 # --- Projenizin Yerel Modülleri ---
 try:
     includes = [
+        "PyQt6.QtCore",
+        "PyQt6.QtGui",
+        "PyQt6.QtWidgets",
         "dialogs",
         "logger",
         "core.workers.download_worker",
@@ -81,6 +84,7 @@ try:
         "includes": includes,
         "include_files": include_files,
         "excludes": excludes,
+        "include_msvcr": True,
     }
 
     # --- Platforma Özel Ayarlar ---

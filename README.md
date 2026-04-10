@@ -107,6 +107,25 @@ yznvltranslate-main/
 ├── setup.py           # Kurulum betiği
 └── file-tree.md       # Proje dizin yapısı ve temel dosyalar hakkında açıklama
 ```
+## API Pool ve MCP Endpoint Rotasyonu
+```text
+429 Kota aşıldı hatası alındı
+    │
+    ▼
+CAS: başka thread zaten geçti mi?
+    ├─ Evet → mevcut kaynakla devam (True)
+    └─ Hayır (ilk raporlayan ben)
+          │
+          ▼
+    Adım 1: provider.rotate_key()
+          ├─ True → aynı endpoint, yeni anahtar (K0→K1→K2) ✓
+          └─ False (pool tükendi)
+                │
+                ▼
+          Adım 2: _all_endpoints[next_idx] → yeni MCP endpoint ✓
+                └─ Hepsi bitti → is_running=False, dur
+```
+
 ## Sürüm Geçmişi
 
 | Sürüm | Değişiklikler |

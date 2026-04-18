@@ -58,14 +58,23 @@ try:
         "ebooklib",
         "ui",
         "core",
-        "core.workers"
+        "core.workers",
+        "qt_material",   # Premium UI tema sistemi
     ]
 
     # --- Dahil Edilecek Ek Dosyalar ---
     include_files = [
         "logo64.ico",
-        "logo256.ico"
+        "logo256.ico",
     ]
+    # qt-material tema XML dosyalarını EXE'ye dahil et
+    try:
+        import qt_material
+        import os as _os
+        qt_material_dir = qt_material.__path__[0]
+        include_files.append((qt_material_dir, "qt_material"))
+    except ImportError:
+        print("[UYARI] qt-material bulunamadı. Tema dosyaları dahil edilmedi.")
 
     # --- Hariç Tutulacaklar ---
 
@@ -105,8 +114,8 @@ try:
     #python setup.py bdist_msi
     setup(
         name="NovelCeviriAraci",
-        version="2.1.0",  # SRP yeniden yapılandırma, Uygulama Ayarları, API İstatistikleri, Toast Bildirimi
-        description="Novel Çeviri Aracı v2.1",
+        version="2.3.0",  # Premium UI modernizasyonu (qt-material entegrasyonu)
+        description="Novel Çeviri Aracı v2.2 — Premium UI Güncellemesi",
         author="UtkuCanC",
         author_email="utkucancanatan@gmail.com",
         options={"build_exe": build_exe_options},

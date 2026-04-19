@@ -57,7 +57,6 @@ try:
         "tiktoken",
         "ebooklib",
         "ui",
-        "numpy",
         "core",
         "core.workers"
     ]
@@ -85,7 +84,9 @@ try:
         "includes": includes,
         "include_files": include_files,
         "excludes": excludes,
-        "include_msvcr": True,  # DLL eksikliklerini önlemek için Visual C++ kütüphanelerini dahil edin
+        "include_msvcr": True,
+        "zip_include_packages": "*",
+        "zip_exclude_packages": ["numpy"], 
     }
 
     # --- Platforma Özel Ayarlar ---
@@ -105,8 +106,8 @@ try:
     #python setup.py bdist_msi
     setup(
         name="NovelCeviriAraci",
-        version="2.1.0",  # SRP yeniden yapılandırma, Uygulama Ayarları, API İstatistikleri, Toast Bildirimi
-        description="Novel Çeviri Aracı v2.1",
+        version="2.2.1",  
+        description="Novel Çeviri Aracı v2.2.1",
         author="UtkuCanC",
         author_email="utkucancanatan@gmail.com",
         options={"build_exe": build_exe_options},

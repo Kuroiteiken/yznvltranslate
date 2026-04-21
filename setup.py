@@ -105,7 +105,8 @@ try:
         "include_files": include_files,
         "excludes": excludes,
         "include_msvcr": True,
-        "zip_exclude_packages": ["numpy"],
+        "zip_include_packages": "*",
+        "zip_exclude_packages": ["numpy"], 
     }
 
     # --- Platforma Özel Ayarlar ---

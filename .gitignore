@@ -9,10 +9,12 @@ __pycache__/
 
 ## Bölüm - 529 ##
 # Distribution / packaging
+oydvar/
 AppConfigs/
 .Python
 oydvar/
 build/
+odyvar/
 develop-eggs/
 dist/
 downloads/

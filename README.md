@@ -24,6 +24,7 @@ Bu proje, yabancı dildeki (özellikle İngilizce, Korece, Çince gibi) web roma
   - **Paragraf Bazlı Çeviri (v2.1.0):** Cache aktif olsun olmasın her dosya otomatik olarak paragraflara bölünür; her paragraf bağımsız çevrilip birleştirilir. Büyük dosyalarda token verimliliğini artırır.
   - **Asenkron Çeviri (V2.1.0):** Proje ayarları kısmından sayısı düzenlenebilir paralel çeviri sistemi. Aynı anda API isteği göndererek birden fazla dosyanın çeviri yapılabilmesine imkan sağlar.(Gemini için worker sayısı 3 tavsiye edilmektedir. 3 Worker RPM değeri 11-12 aralığındadır.)
   - **Toplu Çeviri / Batch Mode (v2.1.0 - Test):** Birden fazla bölümü `===CHAPTER_START===` / `===CHAPTER_END===` ayraçlarıyla tek bir API isteğine paketler. Aynı RPD kotasıyla daha fazla bölüm çevrilmesini sağlar. Parse başarısız olursa otomatik tekli moda düşer.
+  - **Gelişmiş Terminoloji Sistemi(V2.4.0):** Terminoloji işlemine bölüm aralığı seçim diyalogu eklendi. Son işlem bilgisi kaydediliyor ve terminoloji penceresinde gösteriliyor. Böylece TPM sınırlarını kontrol ederek tüm hikayenin terminolojisini çıkarma imkanı elde edildi.
 * **Dosya Manipülasyonu**:
   - `Toplu Bölüm Ekle`: Büyük boyutlu `.txt` dosyalarını "## Bölüm - X ##" ayracı baz alınarak otomatik parçalara ayırma.
   - Geliştirilmiş çift tıklama ile açılan Metin Düzenleyici (Text Editor) üzerinden anlık düzeltme.

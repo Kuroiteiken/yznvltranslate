@@ -257,17 +257,7 @@ class MLTerminologyExtractor:
             added_terms = new_terms
             skipped_terms = []
 
-        # ── DEV_LOG BAŞLANGIÇ ── (geliştirme aşaması diff raporu — kolayca silinebilir)
-        try:
-            self._write_dev_diff_log(
-                existing_before=existing_terms[:len(existing_terms) - len(added_terms)],
-                added_terms=added_terms,
-                skipped_terms=skipped_terms,
-                append=append,
-            )
-        except Exception as _dev_err:
-            logger.debug(f"[DEV_LOG] Diff raporu yazılamadı: {_dev_err}")
-        # ── DEV_LOG BİTİŞ ──
+
             
         try:
             with open(terms_file, 'w', encoding='utf-8') as f:
@@ -278,73 +268,6 @@ class MLTerminologyExtractor:
         except Exception as e:
             logger.error(f"Terminoloji dosyası kaydedilemedi: {e}")
 
-    # ── DEV_LOG YARDIMCI METOT BAŞLANGIÇ ── (geliştirme aşaması — kolayca silinebilir)
-    def _write_dev_diff_log(self, existing_before: list, added_terms: list,
-                            skipped_terms: list, append: bool):
-        """
-        Terminoloji işlemi sonrası fark raporu oluşturur.
-        Çıktı: proje_dizini/config/terminology_diff.log
-
-        Bu metodun tamamı (ve çağrısı) geliştirme aşaması içindir;
-        production'da silinebilir veya devre dışı bırakılabilir.
-        """
-        import datetime
-        log_path = os.path.join(self.config_dir, "terminology_diff.log")
-        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        lines = []
-        lines.append("=" * 70)
-        lines.append(f"[DEV DIFF RAPORU]  {now}")
-        lines.append(f"Mod: {'EKLE (append)' if append else 'YENİDEN YAZ'}")
-        lines.append("=" * 70)
-
-        # ── Mevcut Terimler (işlemden önce) ──
-        lines.append(f"\n📚 MEVCUT TERİMLER ÖNCEKİ ({len(existing_before)} adet):")
-        if existing_before:
-            for i, t in enumerate(existing_before, 1):
-                note = f"  [{t.get('note', '')}]" if t.get('note') else ""
-                lines.append(f"  {i:>4}. {t['source']}  →  {t['target']}{note}")
-        else:
-            lines.append("  (boş — ilk çalışma)")
-
-        # ── Yeni Eklenen Terimler ──
-        lines.append(f"\n✅ YENİ EKLENEN TERİMLER ({len(added_terms)} adet):")
-        if added_terms:
-            for i, t in enumerate(added_terms, 1):
-                lines.append(f"  {i:>4}. + {t['source']}  →  {t['target']}")
-        else:
-            lines.append("  (hiç yeni terim eklenmedi)")
-
-        # ── Atlanan Terimler (tekrar) ──
-        lines.append(f"\n⏭  ATLANAN TERİMLER — ZATEN MEVCUT ({len(skipped_terms)} adet):")
-        if skipped_terms:
-            for i, t in enumerate(skipped_terms, 1):
-                lines.append(f"  {i:>4}. ~ {t['source']}  →  {t['target']}")
-        else:
-            lines.append("  (atlanmış terim yok)")
-
-        lines.append("\n" + "=" * 70 + "\n")
-
-        with open(log_path, "a", encoding="utf-8") as f:
-            f.write("\n".join(lines))
-
-        # Console'a da kısa özet yaz
-        logger.info(
-            f"[DEV_LOG] Diff raporu güncellendi → {log_path}\n"
-            f"          Mevcut: {len(existing_before)} | "
-            f"Yeni eklenen: {len(added_terms)} | "
-            f"Atlanan: {len(skipped_terms)}"
-        )
-        # Yeni eklenenler konsola da bas (hızlı kontrol için)
-        if added_terms:
-            preview = "\n".join(
-                f"          + {t['source']}  →  {t['target']}"
-                for t in added_terms[:20]
-            )
-            if len(added_terms) > 20:
-                preview += f"\n          ... ve {len(added_terms) - 20} terim daha"
-            logger.info(f"[DEV_LOG] Yeni eklenen terimler:\n{preview}")
-    # ── DEV_LOG YARDIMCI METOT BİTİŞ ──
 
 
 def main():
